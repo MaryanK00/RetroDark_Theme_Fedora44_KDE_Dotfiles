@@ -1,0 +1,7 @@
+[TabBox]
+LayoutName=coverswitch
+
+[org.kde.kdecoration2]
+NoPlugin=false
+library=org.kde.darkly
+theme=Darkly

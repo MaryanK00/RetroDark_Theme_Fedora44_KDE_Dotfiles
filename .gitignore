@@ -1,0 +1,42 @@
+# copias renderizadas por install.sh (contienen rutas absolutas)
+rendered/
+
+# sonidos de Nier: propiedad de sus autores originales, no se distribuyen.
+# se generan en local con scripts/make-sounds.sh
+files/config/opencode/sounds/*.wav
+
+# respaldos
+*.bak
+*.orig
+*.rej
+
+# credenciales y claves: nunca deben entrar
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.gpg
+*.asc
+id_rsa*
+id_ed25519*
+.netrc
+.pgpass
+credentials
+credentials.json
+hosts.yml
+auth.json
+service.json
+*.kdbx
+secring.gpg
+private-keys-v1.d
+
+# historiales
+*_history
+.history/
+
+# ruido
+*.log
+logs/
+.DS_Store
+Thumbs.db

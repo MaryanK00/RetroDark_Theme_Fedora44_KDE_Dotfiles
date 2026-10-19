@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Hook pre-commit: bloquea el commit si hay secretos o ficheros demasiado grandes.
+set -uo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO" || exit 1
+
+fail=0
+
+# --- 1) gitleaks ---
+# Ojo: hay que distinguir "ha encontrado un secreto" de "ha fallado la ejecucion".
+# Un fallo de gitleaks NO puede interpretarse como "repo limpio".
+if command -v gitleaks >/dev/null 2>&1; then
+    gleaks_out="$(gitleaks protect --staged --redact --no-banner 2>&1)"
+    gleaks_rc=$?
+    if grep -qi "no leaks found" <<<"$gleaks_out"; then
+        echo "  gitleaks: limpio"
+    elif grep -qi "leaks found" <<<"$gleaks_out"; then
+        echo "  gitleaks: SE HAN ENCONTRADO SECRETOS en el contenido preparado (--staged)"
+        echo "            revisa con:  gitleaks detect --source . --redact --no-git"
+        fail=1
+    else
+        echo "  gitleaks: ERROR al ejecutarse (rc=${gleaks_rc}), no se puede descartar que haya secretos:"
+        grep -iE "error|fatal|FTL" <<<"$gleaks_out" | head -3 | sed 's/^/            /'
+        fail=1
+    fi
+else
+    echo "  gitleaks: no instalado (se omite esta comprobacion)"
+    fail=1
+fi
+
+# --- 2) escaner propio ---
+if out="$(bash "${REPO}/scripts/scan-secrets.sh" . 2>&1)"; then
+    echo "$out" | grep -E "esc|SIN|coincidencia" | sed 's/^/  /'
+else
+    echo "$out" | sed 's/^/  /'
+    fail=1
+fi
+
+# --- 3) tamano de los ficheros preparados ---
+big=$(git diff --cached --name-only --diff-filter=ACM | while read -r f; do
+    [ -f "$f" ] || continue
+    sz=$(stat -c%s "$f")
+    [ "$sz" -gt 1048576 ] && echo "$f ($((sz/1024)) KB)"
+done)
+if [[ -n "$big" ]]; then
+    echo "  ficheros > 1 MB preparados:"
+    echo "$big" | sed 's/^/    /'
+    echo "    (un repositorio de dotfiles no deberia llevar binarios grandes)"
+    fail=1
+fi
+
+# --- 4) huella de la maquina en el contenido preparado ---
+leak=$(git diff --cached --name-only --diff-filter=ACM | while read -r f; do
+    [ -f "$f" ] || continue
+    grep -Il "/home/[A-Za-z0-9._-]\+" "$f" 2>/dev/null
+done)
+if [[ -n "$leak" ]]; then
+    echo "  rutas absolutas del home en el contenido preparado:"
+    echo "$leak" | sed 's/^/    /'
+    echo "    debe emplearse el marcador __HOME__ en las plantillas"
+    fail=1
+fi
+
+echo
+if [[ $fail -ne 0 ]]; then
+    echo "COMMIT BLOQUEADO. Corregir lo anterior o invocar con --no-verify."
+    exit 1
+fi
+echo "Todo correcto."
+exit 0

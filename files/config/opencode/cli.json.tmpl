@@ -1,0 +1,51 @@
+{
+  "$schema": "https://opencode.ai/v2/cli.json",
+
+  "theme": { "name": "retro-dark", "mode": "system" },
+
+  "animations": true,
+  "cursor": { "style": "block", "blinking": true },
+
+  "mouse": true,
+  "scroll": { "speed": 3, "acceleration": false },
+  "prompt": { "editor": true, "paste": "compact", "image_preview": true },
+
+  "session": {
+    "sidebar": "auto",
+    "scrollbar": true,
+    "thinking": "hide",
+    "grouping": "auto",
+    "image_preview": true,
+    "tps": true,
+    "markdown": "rendered",
+    "new_location": "launch",
+    "permissions": "prompt"
+  },
+
+  "tabs": { "mode": "auto", "scope": "cwd", "layout": "horizontal", "indicators": "status" },
+  "diffs": { "source": "branch", "wrap": "word", "tree": true, "single": false, "view": "auto" },
+  "attention": {
+    "notifications": true,
+    "sound": true,
+    "volume": 0.4,
+    "sound_pack": "opencode.default",
+    "sounds": {
+      "default": "__HOME__/.config/opencode/sounds/default.wav",
+      "question": "__HOME__/.config/opencode/sounds/question.wav",
+      "permission": "__HOME__/.config/opencode/sounds/permission.wav",
+      "error": "__HOME__/.config/opencode/sounds/error.wav",
+      "done": "__HOME__/.config/opencode/sounds/done.wav",
+      "subagent_done": "__HOME__/.config/opencode/sounds/subagent_done.wav"
+    }
+  },
+  "terminal": { "title": true, "copy": "select" },
+
+  "keybinds": {
+    "leader": "ctrl+x",
+    "theme.switch": "ctrl+alt+g",
+    "theme.switch_mode": "ctrl+alt+shift+g",
+    "opencode.settings": "ctrl+alt+o",
+    "help.show": "ctrl+alt+h"
+  },
+  "leader": { "timeout": 2000 }
+}
