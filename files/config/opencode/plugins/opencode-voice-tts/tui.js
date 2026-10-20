@@ -55,8 +55,6 @@ const DEFAULT_SHORTCUTS = {
 
 /** Cache de atajos: se relee solo cuando cambia el mtime del fichero. */
 let shortcutsCache = null
-/** El fichero de atajos tal cual, para leer opciones que no son atajos. */
-let rawShortcuts = null
 let shortcutsMtime = 0
 let shortcutsCheckedAt = 0
 
@@ -67,10 +65,6 @@ let shortcutsCheckedAt = 0
  * con los avisos que ver el terminal lleno de errores. Se apaga poniendo
  * {"panel": false} en el fichero de atajos.
  */
-function panelActivo() {
-  return rawShortcuts?.panel !== false
-}
-
 /**
  * Lee los atajos del fichero del usuario.
  *
@@ -85,7 +79,6 @@ function loadShortcuts() {
       writeFileSync(SHORTCUTS_FILE, JSON.stringify(DEFAULT_SHORTCUTS, null, 2) + "\n")
       trace("atajos: fichero creado con los valores por defecto")
       shortcutsCache = DEFAULT_SHORTCUTS
-      rawShortcuts = {}
       shortcutsMtime = 0
       return shortcutsCache
     }
@@ -107,7 +100,6 @@ function loadShortcuts() {
       out[action] = clean.length > 0 ? clean : fallback
     }
     shortcutsCache = out
-    rawShortcuts = raw
     shortcutsMtime = mtime
     trace("atajos cargados:", JSON.stringify(out))
     return out
@@ -255,117 +247,15 @@ async function setupInner(context) {
   // true mientras el borrador esta en el dialogo de revision
   let draftOpen = false
 
-  // ---- Panel lateral en vivo ---------------------------------------------
-  // Un slot en "sidebar.content" que dibuja el estado de la voz. El render
-  // tiene que devolver un ELEMENTO, no texto plano: un string suelto deja un
-  // nodo de texto sin padre ("Orphan text error"). Por eso se crea un <text>
-  // de verdad con el runtime de Solid, que se importa por ruta absoluta desde
-  // la cache de npm (un plugin local no puede resolver "@opentui/solid").
-  //
-  // OJO: `context.storage.store` tampoco se puede usar desde la mitad TUI de
-  // un plugin local: el namespace se deriva del ID del plugin y el de la
-  // mitad TUI es "<directorio>/tui", que lleva "/" -> OpenCode lo rechaza con
+  // ---- Estado de la voz ---------------------------------------------------
+  // OJO: `context.storage.store` no se puede usar desde la mitad TUI de un
+  // plugin local: el namespace se deriva del ID del plugin y el de la mitad
+  // TUI es "<directorio>/tui", que lleva "/" -> OpenCode lo rechaza con
   // "Invalid storage segment" y ABORTA el setup (con lo que la capa de
   // teclado se queda sin registrar). Por eso el estado vive en variables.
-  //
-  // El panel no se dibuja en el pie de la terminal (prompt.footer.status):
-  // ahi el texto plano descuadraba el ancho de la barra.
 
-  const BARS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
-  const METER_WIDTH = 12
-  let panelText = ""
-  let panelSlot = null
-  let fallosDeSlot = 0
-  let solid = null
-  let lastPhase = ""
-  let levels = []
-  let recStartedAt = 0
-  let localPhase = "idle" // idle | transcribing
   let voiceEnabled = true
   let presetName = "k2"
-
-  /**
-   * Localiza el runtime de Solid en la cache de npm de OpenCode.
-   *
-   * Un plugin local no puede resolver "@opentui/solid" (no esta en su
-   * node_modules), pero el TUI si lo tiene. Se importa por RUTA ABSOLUTA desde
-   * la cache: es la MISMA copia que usa el plugin de Whisper, asi que el
-   * contexto de Solid es el mismo y el <text> se dibuja igual.
-   */
-  const loadSolid = async () => {
-    if (solid) return solid
-    const base = join(homedir(), ".cache/opencode/npm")
-    const candidatos = []
-    // npm anida los paquetes con ambito:
-    // <cache>/npm/@scope/<nombre>@latest/<hash>/node_modules/... -> hay que
-    // buscar en profundidad; con dos niveles no se encuentra nada.
-    const buscar = (dir, profundidad) => {
-      if (profundidad > 4) return
-      let entradas = []
-      try {
-        entradas = readdirSync(dir, { withFileTypes: true })
-      } catch {
-        return
-      }
-      for (const entrada of entradas) {
-        if (!entrada.isDirectory()) continue
-        const sub = join(dir, entrada.name)
-        const candidato = join(sub, "node_modules/@opentui/solid/index.bun.js")
-        if (existsSync(candidato)) {
-          candidatos.push(candidato)
-          continue
-        }
-        buscar(sub, profundidad + 1)
-      }
-    }
-    try {
-      buscar(base, 0)
-    } catch (err) {
-      trace("no se pudo leer la cache de npm:", errText(err))
-    }
-    // Se prefiere la copia del plugin de Whisper: es la que usa el TUI.
-    candidatos.sort((a, b) => (b.includes("@juliuskb") ? 1 : 0) - (a.includes("@juliuskb") ? 1 : 0))
-    // Primero el especificador tal cual: si el runtime de OpenCode lo resuelve
-    // (como hace con "@opencode/plugin/tui") sale SU copia, que es la MISMA
-    // instancia que usa el TUI -> el contexto de Solid es el compartido y el
-    // <text> se dibuja. La copia de la cache puede ser OTRA instancia (con su
-    // propio solid-js) y entonces el contexto no existe -> "No renderer found".
-    for (const esp of ["@opentui/solid", ...candidatos]) {
-      try {
-        solid = await import(esp)
-        trace("runtime de solid:", esp)
-        return solid
-      } catch (err) {
-        trace("no se pudo cargar", esp, errText(err))
-      }
-    }
-    // Modo de prueba: un runtime roto a proposito, para comprobar que el
-    // slot no propaga el error ni lo repite en bucle.
-    if (process.env.OPENCODE_VOICE_TEST_BREAK_SOLID === "1") {
-      solid = {
-        createComponent: () => {
-          throw new Error("runtime de solid roto de prueba")
-        },
-        createElement: () => ({}),
-        insert: () => {},
-      }
-      trace("runtime de solid roto de prueba")
-      return solid
-    }
-    trace("sin runtime de solid: el panel lateral no se dibujara")
-    return null
-  }
-
-  const meter = () => {
-    const cells = levels.slice(-METER_WIDTH)
-    let out = " ".repeat(Math.max(0, METER_WIDTH - cells.length))
-    for (const v of cells) {
-      const lvl = Math.round(Math.max(0, Math.min(1, v)) * (BARS.length - 1))
-      out += BARS[lvl]
-    }
-    return out
-  }
-
 
   /**
    * Pinta el panel lateral. Recibe la FASE y compone el texto aqui, para que
@@ -376,65 +266,6 @@ async function setupInner(context) {
    * que hay que crear el <text> con el runtime de Solid. El elemento se crea
    * dentro de render (que es donde hay contexto de Solid) y se reutiliza.
    */
-  const drawPanel = (fase) => {
-    const texto =
-      fase === "grabando"
-        ? "grabando " + Math.floor((Date.now() - recStartedAt) / 1000) + "s " + meter()
-        : fase === "transcribing"
-          ? "transcribiendo..."
-          : voiceEnabled
-            ? "voz: " + presetName
-            : "voz: silenciada"
-    if (texto === panelText) return
-    if (fase !== lastPhase) {
-      lastPhase = fase
-      trace("panel lateral:", fase)
-    }
-    panelText = texto
-    trace("panel:", texto)
-    try {
-      if (panelSlot) {
-        panelSlot()
-        panelSlot = null
-      }
-      if (!solid) return
-      if (!panelActivo()) {
-        trace("el panel lateral esta apagado (panel: false en el fichero de atajos)")
-        return
-      }
-      // El render tiene que devolver un COMPONENTE, no un elemento: el
-      // contexto de Solid solo existe dentro del arbol que dibuja OpenTUI.
-      // Es el mismo patron que usa el panel del plugin de Whisper
-      // (`_$createComponent(VoicePanel, {})`).
-      const Panel = () => {
-        const el = solid.createElement("text")
-        solid.insert(el, () => panelText)
-        return el
-      }
-      panelSlot = context.ui.slot({
-        append: "sidebar.content",
-        render: () => {
-          try {
-            return solid.createComponent(Panel, {})
-          } catch (err) {
-            fallosDeSlot++
-            trace("el panel lateral ha fallado:", errText(err), "| stack:", err?.stack ?? "(sin stack)")
-            // A la tercera se desregistra: si no, OpenCode repite el error en
-            // bucle ("opencode-voice-tts/tui crashed in slot sidebar").
-            if (fallosDeSlot >= 3 && panelSlot) {
-              trace("el panel lateral se desregistra tras 3 fallos")
-              panelSlot()
-              panelSlot = null
-            }
-            return null
-          }
-        },
-      })
-    } catch (err) {
-      trace("panel lateral:", errText(err))
-    }
-  }
-
   const toast = (message, variant = "info") => {
     try {
       context.ui.toast.show({ title: "Voz", message, variant, duration: 4000 })
@@ -566,52 +397,6 @@ async function setupInner(context) {
   // nivel. Asi el panel se enciende tanto si grabamos con nuestro atajo como
   // si se graba con el atajo del otro plugin (el suyo muestra su propio
   // panel, este muestra el nuestro).
-  const POLL_MS = 200
-  const IDLE_POLL_MS = 1000
-  let pollTimer = null
-  let pollBusy = false
-  let serverRecording = false
-  let lastPollAt = 0
-  let pollErrorLogged = false
-
-  const pollOnce = async () => {
-    if (pollBusy) return
-    // En reposo se pregunta menos: solo hace falta enterarse de que el
-    // microfono se ha puesto a grabar por otra via.
-    const ahora = Date.now()
-    if (!serverRecording && ahora - lastPollAt < IDLE_POLL_MS) return
-    lastPollAt = ahora
-    pollBusy = true
-    try {
-      const r = await withTimeout(voiceRpc().level({}), 4000, "level")
-      serverRecording = !!r?.recording
-      if (serverRecording) {
-        levels = [...levels, r.level ?? 0].slice(-METER_WIDTH)
-        if (!recStartedAt) recStartedAt = Date.now()
-        drawPanel("grabando")
-      } else {
-        levels = []
-        recStartedAt = 0
-        drawPanel(localPhase === "transcribing" ? "transcribing" : "idle")
-      }
-    } catch (err) {
-      // El servidor puede estar caido: no hay que romper la TUI por eso.
-      if (!pollErrorLogged) {
-        pollErrorLogged = true
-        trace("el medidor no pudo preguntar el nivel:", errText(err))
-      }
-    } finally {
-      pollBusy = false
-    }
-  }
-
-  const startPolling = () => {
-    if (pollTimer) return
-    pollTimer = setInterval(() => {
-      void pollOnce()
-    }, POLL_MS)
-    void pollOnce()
-  }
 
   /**
    * Suelta la custodia del audio de una transcripcion.
@@ -644,7 +429,6 @@ async function setupInner(context) {
       if (d.client && d.client !== CLIENT_ID) return
       const take = typeof d.take === "string" ? d.take : ""
       trace("evento result:", d.error ? "error=" + d.error : (d.text ?? "").slice(0, 80), "| take:", take || "(ninguno)")
-      localPhase = "idle"
       if (d.error) {
         toast("Transcripcion fallida: " + d.error, "error")
         return
@@ -750,7 +534,6 @@ async function setupInner(context) {
       recording = false
       startedByUs = false
       const stopped = await withTimeout(voiceRpc().recordStop({}), 20000, "recordStop")
-      localPhase = "transcribing"
       const wav = stopped?.wav
       const seconds = stopped?.seconds ?? 0
       trace("grabacion detenida:", seconds, "s ->", wav)
@@ -761,7 +544,6 @@ async function setupInner(context) {
       toast("Transcribiendo...", "info")
       await withTimeout(voiceRpc().transcribe({ wav, client: CLIENT_ID }), 20000, "transcribe")
     } catch (err) {
-      localPhase = "idle"
       trace("dictado fallo:", errText(err))
       toast("Dictado: " + errText(err), "error")
     } finally {
@@ -776,7 +558,6 @@ async function setupInner(context) {
       const next = !st?.enabled
       await withTimeout(ttsRpc().setEnabled({ enabled: next }), 8000, "voice-tts.setEnabled")
       voiceEnabled = next
-      drawPanel("idle")
       toast(next ? "Voz activada" : "Voz silenciada", next ? "success" : "info")
     } catch (err) {
       trace("toggle de voz fallo:", errText(err))
@@ -792,7 +573,6 @@ async function setupInner(context) {
       const next = presets[(i + 1) % presets.length] ?? st?.preset
       await withTimeout(ttsRpc().setPreset({ preset: next }), 8000, "voice-tts.setPreset")
       presetName = next
-      drawPanel("idle")
       toast("Voz: " + next, "success")
     } catch (err) {
       trace("cambio de preset fallo:", errText(err))
@@ -991,7 +771,6 @@ async function setupInner(context) {
         trace("rpc voice-tts status:", JSON.stringify(st))
         if (st && typeof st.enabled === "boolean") voiceEnabled = st.enabled
         if (st?.preset) presetName = st.preset
-        drawPanel("idle")
         try {
           const vst = await withTimeout(voiceRpc().status({}), 5000, "voice.status")
           trace("rpc voice status:", JSON.stringify(vst))
@@ -1004,10 +783,7 @@ async function setupInner(context) {
       }
     }
   }
-  await loadSolid()
-  drawPanel("idle")
   void selfCheck()
-  startPolling()
 
   return () => {
     try {
@@ -1029,14 +805,6 @@ async function setupInner(context) {
         }
       })()
     }
-    try {
-      if (pollTimer) clearInterval(pollTimer)
-      pollTimer = null
-    } catch {}
-    try {
-      if (panelSlot) panelSlot()
-      panelSlot = null
-    } catch {}
     trace("cleanup")
   }
 }
