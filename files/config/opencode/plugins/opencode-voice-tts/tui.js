@@ -31,7 +31,7 @@
  * local (el namespace deriva del ID, y el de la mitad TUI es
  * "<directorio>/tui", con barra -> "Invalid storage segment").
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -79,7 +79,8 @@ function loadShortcuts() {
     // Se comprueba como mucho dos veces por segundo: `loadShortcuts` se llama
     // en cada pulsacion de tecla y un statSync por tecla es wasteful.
     const now = Date.now()
-    if (shortcutsCache && mtime === shortcutsMtime && now - shortcutsCheckedAt < 500) return shortcutsCache
+    if (shortcutsCache && now - shortcutsCheckedAt < 500) return shortcutsCache
+    if (shortcutsCache && mtime === shortcutsMtime) return shortcutsCache
     shortcutsCheckedAt = now
     const raw = JSON.parse(readFileSync(SHORTCUTS_FILE, "utf8"))
     const out = {}
@@ -255,12 +256,51 @@ async function setupInner(context) {
   const METER_WIDTH = 12
   let panelText = ""
   let panelSlot = null
+  let panelEl = null
+  let solid = null
   let lastPhase = ""
   let levels = []
   let recStartedAt = 0
   let localPhase = "idle" // idle | transcribing
   let voiceEnabled = true
   let presetName = "k2"
+
+  /**
+   * Localiza el runtime de Solid en la cache de npm de OpenCode.
+   *
+   * Un plugin local no puede resolver "@opentui/solid" (no esta en su
+   * node_modules), pero el TUI si lo tiene. Se importa por RUTA ABSOLUTA desde
+   * la cache: es la MISMA copia que usa el plugin de Whisper, asi que el
+   * contexto de Solid es el mismo y el <text> se dibuja igual.
+   */
+  const loadSolid = async () => {
+    if (solid) return solid
+    const base = join(homedir(), ".cache/opencode/npm")
+    const candidatos = []
+    try {
+      for (const paquete of readdirSync(base)) {
+        for (const sub of readdirSync(join(base, paquete))) {
+          const p = join(base, paquete, sub, "node_modules/@opentui/solid/index.bun.js")
+          if (existsSync(p)) candidatos.push(p)
+        }
+      }
+    } catch (err) {
+      trace("no se pudo leer la cache de npm:", errText(err))
+    }
+    // Se prefiere la copia del plugin de Whisper: es la que usa el TUI.
+    candidatos.sort((a, b) => (b.includes("@juliuskb") ? 1 : 0) - (a.includes("@juliuskb") ? 1 : 0))
+    for (const p of candidatos) {
+      try {
+        solid = await import(p)
+        trace("runtime de solid:", p)
+        return solid
+      } catch (err) {
+        trace("no se pudo cargar", p, errText(err))
+      }
+    }
+    trace("sin runtime de solid: el panel lateral no se dibujara")
+    return null
+  }
 
   const meter = () => {
     const cells = levels.slice(-METER_WIDTH)
@@ -272,29 +312,48 @@ async function setupInner(context) {
     return out
   }
 
-  const idlePanel = () => (voiceEnabled ? "voz: " + presetName : "voz: silenciada")
 
   /**
-   * Pinta el panel lateral. Solo vuelve a registrar el slot si el texto ha
-   * cambiado: el slot no es reactivo (sin Solid), asi que redibujar es
-   *registrar de nuevo. Si el texto no cambia, no se toca nada.
+   * Pinta el panel lateral. Recibe la FASE y compone el texto aqui, para que
+   * el texto exista en un solo sitio y no haya tres ternarios repetidos.
+   *
+   * Un slot NO admite texto plano: OpenTUI exige un elemento de verdad
+   * ("Orphan text error: \"voz: k2\" must have a <text> as a parent"), asi
+   * que hay que crear el <text> con el runtime de Solid. El elemento se crea
+   * dentro de render (que es donde hay contexto de Solid) y se reutiliza.
    */
-  const drawPanel = (text) => {
-    if (text === panelText) return
-    const fase = text.startsWith("grabando") ? "grabando" : text.startsWith("transcribiendo") ? "transcribiendo" : "idle"
+  const drawPanel = (fase) => {
+    const texto =
+      fase === "grabando"
+        ? "grabando " + Math.floor((Date.now() - recStartedAt) / 1000) + "s " + meter()
+        : fase === "transcribing"
+          ? "transcribiendo..."
+          : voiceEnabled
+            ? "voz: " + presetName
+            : "voz: silenciada"
+    if (texto === panelText) return
     if (fase !== lastPhase) {
       lastPhase = fase
       trace("panel lateral:", fase)
     }
-    panelText = text
+    panelText = texto
+    trace("panel:", texto)
     try {
       if (panelSlot) {
         panelSlot()
         panelSlot = null
       }
+      panelEl = null
+      if (!solid) return
       panelSlot = context.ui.slot({
         append: "sidebar.content",
-        render: () => panelText,
+        render: () => {
+          if (!panelEl) {
+            panelEl = solid.createElement("text")
+            solid.insert(panelEl, () => panelText)
+          }
+          return panelEl
+        },
       })
     } catch (err) {
       trace("panel lateral:", errText(err))
@@ -339,11 +398,11 @@ async function setupInner(context) {
       if (serverRecording) {
         levels = [...levels, r.level ?? 0].slice(-METER_WIDTH)
         if (!recStartedAt) recStartedAt = Date.now()
-        drawPanel("grabando " + Math.floor((Date.now() - recStartedAt) / 1000) + "s " + meter())
+        drawPanel("grabando")
       } else {
         levels = []
         recStartedAt = 0
-        drawPanel(localPhase === "transcribing" ? "transcribiendo..." : idlePanel())
+        drawPanel(localPhase === "transcribing" ? "transcribing" : "idle")
       }
     } catch (err) {
       // El servidor puede estar caido: no hay que romper la TUI por eso.
@@ -510,7 +569,7 @@ async function setupInner(context) {
       const next = !st?.enabled
       await withTimeout(ttsRpc().setEnabled({ enabled: next }), 8000, "voice-tts.setEnabled")
       voiceEnabled = next
-      drawPanel(idlePanel())
+      drawPanel("idle")
       toast(next ? "Voz activada" : "Voz silenciada", next ? "success" : "info")
     } catch (err) {
       trace("toggle de voz fallo:", errText(err))
@@ -526,7 +585,7 @@ async function setupInner(context) {
       const next = presets[(i + 1) % presets.length] ?? st?.preset
       await withTimeout(ttsRpc().setPreset({ preset: next }), 8000, "voice-tts.setPreset")
       presetName = next
-      drawPanel(idlePanel())
+      drawPanel("idle")
       toast("Voz: " + next, "success")
     } catch (err) {
       trace("cambio de preset fallo:", errText(err))
@@ -725,6 +784,7 @@ async function setupInner(context) {
         trace("rpc voice-tts status:", JSON.stringify(st))
         if (st && typeof st.enabled === "boolean") voiceEnabled = st.enabled
         if (st?.preset) presetName = st.preset
+        drawPanel("idle")
         try {
           const vst = await withTimeout(voiceRpc().status({}), 5000, "voice.status")
           trace("rpc voice status:", JSON.stringify(vst))
@@ -737,6 +797,8 @@ async function setupInner(context) {
       }
     }
   }
+  await loadSolid()
+  drawPanel("idle")
   void selfCheck()
   startPolling()
 
@@ -772,6 +834,14 @@ export default {
       return await setupInner(context)
     } catch (err) {
       trace("setup fallo:", errText(err))
+      try {
+        context.ui.toast.show({
+          title: "Voz",
+          message: "El plugin de voz no ha podido arrancar: " + errText(err),
+          variant: "error",
+          duration: 15000,
+        })
+      } catch {}
       return () => trace("cleanup")
     }
   },

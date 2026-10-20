@@ -527,6 +527,29 @@ plugin de Whisper lo ejecuta bajo un watchdog que lo mata si OpenCode muere, y
 barre grabadores huerfanos al arrancar. Al terminar, se abre un **borrador
 editable** con lo que dijo el micro: `Enter` lo envia, `Esc` lo descarta.
 
+#### Una sola interfaz de voz
+
+Hay dos plugins de voz: `@juliuskb/opencode-voice` (el motor de Whisper) y
+`opencode-voice-tts` (el de aqui, que ademas lee las respuestas en voz alta).
+Cada uno traia su propia interfaz de terminal, asi que habia **dos atajos de
+grabacion** y **dos paneles**.
+
+Se deja **una sola**: la de este plugin. Para que aguante, `opencode-voice-tts`
+apaga en cada arranque la mitad de terminal del otro (sustituye su
+`dist/tui.js` por un stub y guarda el original en `dist/tui.js.orig`).
+
+**El motor de Whisper no se toca**: su mitad servidor, que es la que aporta
+el modelo, la captura, el VAD y la transcripcion, sigue intacta. Este plugin
+le habla por su RPC `voice`.
+
+```bash
+# reaplicar el parche a mano (tambien lo hace scripts/install-voice.sh)
+scripts/patch-voice-plugin.sh
+```
+
+OpenCode reinstala los plugins con un hash nuevo cada cierto tiempo y suelta
+el parche, por eso se reaplica solo en cada arranque.
+
 #### El panel lateral de voz
 
 En la barra lateral (a la derecha) aparece nuestro propio panel:
@@ -647,6 +670,21 @@ Por la misma razon **no hay indicador en la barra inferior** (el pie de la
 terminal): ahi el texto plano descuadraba el ancho de la barra. El estado se ve
 en los avisos (toast) que salen al pulsar los atajos y en el **panel lateral**
 (ver "El panel lateral de voz").
+
+#### La puerta: el test de humo
+
+`scripts/test-voice-tui.mjs` monta un contexto falso de OpenTUI y comprueba
+que la mitad TUI arranca, que registra la capa de teclado y el panel, y que
+el texto del panel es el correcto. Antes de tocar nada:
+
+```bash
+node --check files/config/opencode/plugins/opencode-voice-tts/tui.js
+node scripts/test-voice-tui.mjs
+```
+
+Ese test ya ha pillado dos roturas que `node --check` no ve: un `r` suelto y
+una variable sin declarar. Un identificador suelto **parsea bien** pero
+revienta al ejecutarlo.
 
 #### Cambiar la mitad TUI: hay que reiniciar el terminal
 

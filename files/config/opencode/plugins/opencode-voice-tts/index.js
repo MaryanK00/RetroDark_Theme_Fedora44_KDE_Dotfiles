@@ -12,7 +12,7 @@
  */
 
 import { spawn } from "node:child_process"
-import { appendFileSync, mkdirSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 import { mkdir, rm, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
@@ -477,6 +477,9 @@ export const OpencodeVoiceTTS = {
     g.owner = { token, at: Date.now() }
     trace("setup: soy la instancia activa")
 
+    // Que solo haya una interfaz de voz: la de este plugin.
+    disableWhisperTui()
+
     // Estado persistente.
     try {
       const savedEnabled = await ctx.storage.get(KEY_ENABLED)
@@ -793,6 +796,83 @@ export const OpencodeVoiceTTS = {
       if (g.owner.token === token) g.owner = { token: null, at: 0 }
     }
   },
+}
+
+
+// ------------------------------------------------------------------
+// Apaga la mitad de TERMINAL del plugin de Whisper.
+//
+// @juliuskb/opencode-voice trae su propia interfaz de terminal: un panel
+// lateral con el medidor de microfono y su propio atajo de grabacion. Eso
+// duplica lo que ya hace este plugin, y su atajo no llegaba al keymap de
+// OpenTUI (las teclas de funcion no se reparten bien).
+//
+// Se apaga SOLO esa mitad: su motor de Whisper (la mitad servidor, que vive
+// en src/index.ts y se importa con el export ".") sigue intacto, y es
+// justamente el que aporta captura, VAD y transcripcion a traves del RPC
+// "voice". Por eso se sustituye dist/tui.js por un stub en vez de quitar el
+// export "./tui": asi el plugin sigue anunciando features.tui = true y el
+// cargador no protesta.
+//
+// OpenCode reinstala los plugins con un hash nuevo cada cierto tiempo, asi que
+// esto se repite en cada arranque: si vuelve el original, se vuelve a apagar.
+const WHISPER_TUI_STUB = `/**
+ * Mitad de TERMINAL desactivada a proposito por el plugin opencode-voice-tts.
+ *
+ * La mitad SERVIDORA de este plugin (el motor de Whisper) sigue intacta.
+ */
+
+/** @type {import("@opencode/plugin/tui").Plugin} */
+const VoiceTuiDisabled = {
+  id: "@juliuskb/opencode-voice/tui-disabled",
+  setup() {
+    return () => {}
+  },
+}
+
+export default VoiceTuiDisabled
+`
+
+const disableWhisperTui = () => {
+  try {
+    // npm organiza los paquetes con ambito en un directorio extra:
+    //   <cache>/npm/@juliuskb/opencode-voice@latest/<hash>/node_modules/...
+    // asi que se busca en profundidad el directorio "opencode-voice" que
+    // tenga dist/tui.js.
+    const buscar = (dir, profundidad) => {
+      // La ruta es profunda: <cache>/npm/@juliuskb/opencode-voice@latest/
+      // <hash>/node_modules/@juliuskb/opencode-voice/dist/tui.js
+      if (profundidad > 8) return null
+      let entradas = []
+      try {
+        entradas = readdirSync(dir, { withFileTypes: true })
+      } catch {
+        return null
+      }
+      for (const entrada of entradas) {
+        if (!entrada.isDirectory()) continue
+        const p = join(dir, entrada.name)
+        if (entrada.name === "opencode-voice" && existsSync(join(p, "dist/tui.js"))) {
+          return join(p, "dist/tui.js")
+        }
+        const encontrado = buscar(p, profundidad + 1)
+        if (encontrado) return encontrado
+      }
+      return null
+    }
+    const target = buscar(join(HOME, ".cache/opencode/npm"), 0)
+    if (!target) {
+      trace("no se encontro el plugin de Whisper en la cache de npm")
+      return
+    }
+    const actual = readFileSync(target, "utf8")
+    if (actual.includes("tui-disabled")) return
+    if (!existsSync(target + ".orig")) writeFileSync(target + ".orig", actual)
+    writeFileSync(target, WHISPER_TUI_STUB)
+    trace("mitad de terminal del plugin de Whisper desactivada")
+  } catch (err) {
+    trace("no se pudo desactivar la mitad de terminal de Whisper:", err?.message ?? err)
+  }
 }
 
 export default OpencodeVoiceTTS

@@ -151,6 +151,25 @@ JSON
     fi
 fi
 
+# ------------------------------------- mitad de terminal del plugin de voz
+# El plugin @juliuskb/opencode-voice trae su propia interfaz de terminal: un
+# panel lateral con el medidor de microfono y su propio atajo de grabacion.
+# Eso duplicaba lo que ya hace el plugin opencode-voice-tts (que ademas es el
+# que funciona: el atajo del otro no llegaba al keymap de OpenTUI).
+#
+# Se le apaga SOLO esa mitad de terminal. Su motor de Whisper (la mitad
+# servidor: modelo, captura, VAD y transcripcion) sigue intacto, que es
+# justamente el que usa opencode-voice-tts por su RPC "voice".
+#
+# Se re-aplica en cada instalacion porque OpenCode reinstala el plugin con un
+# hash nuevo y suelta el parche.
+log "desactivando la mitad de terminal del plugin de Whisper..."
+if bash "$(dirname "$0")/patch-voice-plugin.sh" 2>&1 | sed "s/^/  /"; then
+    :
+else
+    log "  no se pudo aplicar ahora; se reintentara en la proxima instalacion"
+fi
+
 # ---------------------------------------------------------------- prueba
 log "probando..."
 if ! echo "prueba de voz" | "$PIPER_BIN" -m "$VOICE_FILE" --output_raw > /dev/null 2>&1; then
@@ -164,4 +183,4 @@ log "  voz   : ${VOICE_FILE}"
 log ""
 log "El plugin de TTS de OpenCode ya esta enlazado en ~/.config/opencode/plugins."
 log "Prueba el sonido con:  /voice-test"
-log "Dicta con F9."
+log "Dicta con: ctrl+space (o alt+d). Silencia la voz con ctrl+alt+m."
