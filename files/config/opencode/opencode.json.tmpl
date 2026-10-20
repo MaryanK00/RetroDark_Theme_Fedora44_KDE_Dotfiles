@@ -1,0 +1,56 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "permissions": [
+    { "action": "edit", "resource": "*.env", "effect": "ask" },
+    { "action": "edit", "resource": "*.key", "effect": "deny" },
+    { "action": "edit", "resource": "id_rsa*", "effect": "deny" },
+    { "action": "edit", "resource": "id_ed25519*", "effect": "deny" },
+    { "action": "shell", "resource": "sudo *", "effect": "ask" },
+    { "action": "shell", "resource": "rm -rf *", "effect": "ask" },
+    { "action": "shell", "resource": "git push *", "effect": "ask" },
+    { "action": "shell", "resource": "curl *|sh", "effect": "ask" }
+  ],
+
+  "warming": true,
+
+  "references": {
+    "dotfiles": {
+      "path": "__HOME__/dotfiles",
+      "description": "Fuente original de la configuracion del sistema: tema retro-dark, sonidos, cli.json, manifest.txt. Edita files/, nunca rendered/."
+    }
+  },
+
+  "mcp": {
+    "timeout": {
+      "startup": 60000,
+      "catalog": 30000,
+      "execution": 600000
+    },
+    "servers": {
+      "context7": {
+        "type": "remote",
+        "url": "https://mcp.context7.com/mcp",
+        "oauth": false,
+        "headers": {
+          "CONTEXT7_API_KEY": "{env:CONTEXT7_API_KEY}"
+        }
+      },
+      "github": {
+        "type": "local",
+        "command": ["__HOME__/.config/opencode/bin/github-mcp.sh"]
+      },
+      "playwright": {
+        "type": "local",
+        "command": ["npx", "-y", "@playwright/mcp@latest", "--headless", "--isolated"]
+      }
+    }
+  },
+
+  "plugins": [
+    "@tarquinen/opencode-dcp@latest",
+    "@upstash/context7-opencode",
+    "@juliuskb/opencode-voice",
+    "__HOME__/.config/opencode/plugins/opencode-voice-tts"
+  ]
+}

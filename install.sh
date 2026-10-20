@@ -14,6 +14,25 @@ RENDERED="${REPO}/rendered/$(printf '%s' "$HOME_DIR" | sha256sum | cut -c1-10)"
 log()  { printf '  %s\n' "$*"; }
 warn() { printf '  AVISO: %s\n' "$*" >&2; }
 
+# Crea el symlink solo si falta o si apunta a otro sitio.
+#
+# Ojo: `ln -sfn` RECREA el enlace aunque ya sea correcto, y eso cambia el
+# inode. Los procesos que lo tienen abierto (un file-watcher, por ejemplo)
+# se quedan mirando el enlace viejo y dejan de recibir cambios: la mitad TUI
+# de un plugin deja de recargarse sola. Por eso aqui se comprueba antes.
+ensure_link() {
+    local target="$1" dest="$2"
+    if [[ -L "$dest" && "$(readlink "$dest")" == "$target" ]]; then
+        return 0
+    fi
+    # Si el destino es un directorio de verdad, `ln` se colgaria DENTRO de el.
+    # (El bloque de copia de seguridad de arriba ya lo ha guardado.)
+    if [[ -d "$dest" && ! -L "$dest" ]]; then
+        rm -rf "$dest"
+    fi
+    ln -sfn "$target" "$dest"
+}
+
 [[ -f "${REPO}/manifest.txt" ]] || { echo "ERROR: falta manifest.txt"; exit 1; }
 
 echo "==> Instalando dotfiles desde ${REPO}"
@@ -78,10 +97,10 @@ while IFS=$'\t' read -r src dest mode; do
             -e "s|__GIT_NAME__|${GIT_NAME}|g" \
             -e "s|__GIT_EMAIL__|${GIT_EMAIL}|g" \
             "$src_path" > "$out"
-        ln -sfn "$out" "$dest_path"
+        ensure_link "$out" "$dest_path"
         log "plantilla  ~/${dest}  ->  rendered/${dest}"
     else
-        ln -sfn "$src_path" "$dest_path"
+        ensure_link "$src_path" "$dest_path"
         log "enlace     ~/${dest}  ->  files/${src}"
     fi
     installed=$((installed+1))

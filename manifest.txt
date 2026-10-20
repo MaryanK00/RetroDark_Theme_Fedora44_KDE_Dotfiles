@@ -4,6 +4,7 @@
 # | origen en files/ | destino en ~ | modo |
 # |---|---|---|
 bashrc.tmpl	.bashrc	template
+bashrc.d/opencode-secrets.sh	.bashrc.d/opencode-secrets.sh	link
 bash_profile	.bash_profile	link
 bash_logout	.bash_logout	link
 gitconfig	.gitconfig	template
@@ -19,6 +20,10 @@ config/kdedefaults/kdeglobals	.config/kdedefaults/kdeglobals	link
 config/kdedefaults/ksplashrc	.config/kdedefaults/ksplashrc	link
 config/plasma-org.kde.plasma.desktop-appletsrc.tmpl	.config/plasma-org.kde.plasma.desktop-appletsrc	template
 config/opencode/cli.json.tmpl	.config/opencode/cli.json	template
+config/opencode/opencode.json.tmpl	.config/opencode/opencode.json	template
+config/opencode/AGENTS.md	.config/opencode/AGENTS.md	link
+config/opencode/bin/github-mcp.sh	.config/opencode/bin/github-mcp.sh	link
+config/opencode/secrets.env.example	.config/opencode/secrets.env.example	link
 config/opencode/themes/retro-dark.json	.config/opencode/themes/retro-dark.json	link
 config/opencode/sounds/default.wav	.config/opencode/sounds/default.wav	generated
 config/opencode/sounds/question.wav	.config/opencode/sounds/question.wav	generated
@@ -81,3 +86,4 @@ config/gtk-3.0/assets/minimize-backdrop-hover.svg	.config/gtk-3.0/assets/minimiz
 config/gtk-3.0/assets/minimize-backdrop-normal.svg	.config/gtk-3.0/assets/minimize-backdrop-normal.svg	link
 config/gtk-3.0/assets/minimize-hover.svg	.config/gtk-3.0/assets/minimize-hover.svg	link
 config/gtk-3.0/assets/minimize-normal.svg	.config/gtk-3.0/assets/minimize-normal.svg	link
+config/opencode/plugins/opencode-voice-tts	.config/opencode/plugins/opencode-voice-tts	link

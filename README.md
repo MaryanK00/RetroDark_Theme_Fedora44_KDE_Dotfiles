@@ -53,7 +53,8 @@ Las rutas absolutas se resuelven solas.
 | `~/.config/kitty/` | terminal: tema *Hachiko*, opacidad 0.4, blur 3, FiraCode Nerd Font |
 | `~/.config/kdedefaults/` | configuración de Plasma (kwinrc, plasmarc, kdeglobals…) |
 | `~/.config/plasma-org.kde.plasma.desktop-appletsrc` | paneles, widgets, fondos de pantalla y konsole |
-| `~/.config/opencode/` | tema `retro-dark`, sonidos y `cli.json` |
+| `~/.config/opencode/` | tema `retro-dark`, sonidos, `cli.json`, `opencode.json`, `AGENTS.md`, el arranque del MCP de GitHub y el plugin de voz |
+| `~/.config/opencode/plugins/opencode-voice-tts/` | plugin local que locuciona las respuestas (piper + ffmpeg) |
 | `~/.config/cava/` | visualizador de audio |
 | `~/.config/OpenRGB/` | control de RGB |
 | `~/.config/kate/` | editor Kate |
@@ -158,6 +159,54 @@ El resto de la configuración de sonido sí se incluye:
 }
 ```
 
+## OpenCode: comportamiento, herramientas y agentes
+
+`cli.json` gobierna el **aspecto** de OpenCode. El resto de su
+configuración vive en `opencode.json`, que este repo también instala:
+
+| Fichero | Qué hace |
+|---|---|
+| `~/.config/opencode/opencode.json` | permisos, servidores MCP, referencias, plugin y calentamiento de caché |
+| `~/.config/opencode/AGENTS.md` | instrucciones globales, cargadas en todas las sesiones |
+| `~/.config/opencode/bin/github-mcp.sh` | arranque del servidor MCP de GitHub, con el token del keyring de `gh` |
+| `~/.config/opencode/secrets.env` | claves locales (no se versiona, permisos `600`) |
+
+Lo esencial:
+
+- **Permisos.** La política por defecto de OpenCode es permitir todo. Aquí se
+  añaden solo las guardas que importan: editar `.env` pregunta, editar
+  claves privadas se bloquea, y `sudo`, `rm -rf`, `git push` y `curl \| sh`
+  piden confirmación. Nada más genera ruido.
+- **MCP.** `context7` (documentación de librerías), `github` (repos, issues y
+  PRs) y `playwright` (navegador real). El token de GitHub se lee del
+  keyring de `gh auth login` en cada arranque: no se escribe en ningún
+  fichero.
+- **Plugin.** `@tarquinen/opencode-dcp` recorta del historial las salidas de
+  herramientas que ya no sirven, sin tocar la sesión. Y
+  `@upstash/context7-opencode` añade la skill `context7-mcp`, que busca
+  documentación de librerías por su cuenta.
+- **References.** El repositorio de dotfiles queda accesible para el agente
+  con el alias `dotfiles`, sin cargarlo en el contexto.
+- **`AGENTS.md` global.** Deliberadamente corto: solo restricciones duras
+  que apliquen al 100 % de las peticiones.
+- **Claves.** `~/.config/opencode/secrets.env` guarda las claves locales
+  (permisos `600`, nunca versionadas). Un fragmento de `~/.bashrc.d/` las
+  carga al arrancar con `set -a`, así que OpenCode las encuentra sin
+  guardarlas en la configuración.
+- **Voz.** Dictado con whisper local (sin nube) y locución de las
+  respuestas con piper + una cadena de filtros de ffmpeg. Todo en castellano
+  y sin salir de la máquina. Atajos: `ctrl+space` o `alt+d` para dictar,
+  `ctrl+alt+m` para silenciar la lectura y `ctrl+alt+t` para cambiar de
+  timbre. Comandos: `/speak` (silencia o activa), `/voice` (cambia el preset:
+  `k2`, `e4`, `j1`, `plain`), `/voice-test` y `/voice-capture-test` (prueba
+  del micro y de Whisper). El binario y los modelos no se versionan:
+  `./scripts/install-voice.sh` los deja listos.
+
+El detalle completo —incluido el coste en contexto de cada servidor MCP, por
+qué se usa el paquete de npm en lugar del binario oficial de GitHub, y cómo
+desactivar o cambiar cada pieza— está en
+[`docs/instalacion-guia.md`](docs/instalacion-guia.md).
+
 ## Personalización
 
 ### Plantillas
@@ -225,6 +274,8 @@ bash scripts/scan-secrets.sh .
 ├── scripts/
 │   ├── make-sounds.sh      genera los WAV desde el tema de Nier
 │   └── scan-secrets.sh     escáner de credenciales propio
+├── docs/
+│   └── instalacion-guia.md guía de la parte de OpenCode que no es estética
 ├── hooks/pre-commit        gitleaks + límites de tamaño
 └── rendered/               copias renderizadas (no se versionan)
 ```
