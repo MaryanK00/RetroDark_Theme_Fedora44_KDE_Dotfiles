@@ -94,7 +94,9 @@ const mock = {
   ui: {
     slot: (claim) => {
       slots.push(claim)
-      return () => {}
+      return () => {
+        claim.desregistrado = true
+      }
     },
     toast: { show: () => {} },
     dialog: { prompt: async () => undefined },
@@ -159,6 +161,36 @@ check(
   "el panel se dibuja sin error",
   errorRender === null,
   errorRender ? String(errorRender.message ?? errorRender) : "sin slot (sin runtime de Solid)",
+)
+
+// 3b. el panel NO puede fallar en bucle.
+// Con el runtime roto, el render revienta. El plugin tiene que tragarse el
+// error (que no se propague) y desregistrar el slot a la tercera, o OpenCode
+// repite "opencode-voice-tts/tui crashed in slot sidebar" sin parar.
+process.env.OPENCODE_VOICE_TEST_BREAK_SOLID = "1"
+await import(PLUGIN.href + "?roto=1")
+process.env.OPENCODE_VOICE_TEST_BREAK_SOLID = "0"
+
+const panelRoto = slots.filter((s) => s.append === "sidebar.content").pop()
+let errorRoto = null
+if (panelRoto?.render) {
+  for (let i = 0; i < 4; i++) {
+    try {
+      panelRoto.render({})
+    } catch (err) {
+      errorRoto = err
+    }
+  }
+}
+check(
+  "el panel roto no propaga el error",
+  errorRoto === null,
+  errorRoto ? String(errorRoto.message ?? errorRoto) : "sin error",
+)
+check(
+  "el panel roto se desregistra a la tercera",
+  panelRoto?.desregistrado === true,
+  panelRoto?.desregistrado ? "desregistrado" : "sigue registrado",
 )
 
 // 4. los atajos se leen del fichero

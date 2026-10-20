@@ -261,6 +261,7 @@ async function setupInner(context) {
   const METER_WIDTH = 12
   let panelText = ""
   let panelSlot = null
+  let fallosDeSlot = 0
   let solid = null
   let lastPhase = ""
   let levels = []
@@ -310,14 +311,32 @@ async function setupInner(context) {
     }
     // Se prefiere la copia del plugin de Whisper: es la que usa el TUI.
     candidatos.sort((a, b) => (b.includes("@juliuskb") ? 1 : 0) - (a.includes("@juliuskb") ? 1 : 0))
-    for (const p of candidatos) {
+    // Primero el especificador tal cual: si el runtime de OpenCode lo resuelve
+    // (como hace con "@opencode/plugin/tui") sale SU copia, que es la MISMA
+    // instancia que usa el TUI -> el contexto de Solid es el compartido y el
+    // <text> se dibuja. La copia de la cache puede ser OTRA instancia (con su
+    // propio solid-js) y entonces el contexto no existe -> "No renderer found".
+    for (const esp of ["@opentui/solid", ...candidatos]) {
       try {
-        solid = await import(p)
-        trace("runtime de solid:", p)
+        solid = await import(esp)
+        trace("runtime de solid:", esp)
         return solid
       } catch (err) {
-        trace("no se pudo cargar", p, errText(err))
+        trace("no se pudo cargar", esp, errText(err))
       }
+    }
+    // Modo de prueba: un runtime roto a proposito, para comprobar que el
+    // slot no propaga el error ni lo repite en bucle.
+    if (process.env.OPENCODE_VOICE_TEST_BREAK_SOLID === "1") {
+      solid = {
+        createComponent: () => {
+          throw new Error("runtime de solid roto de prueba")
+        },
+        createElement: () => ({}),
+        insert: () => {},
+      }
+      trace("runtime de solid roto de prueba")
+      return solid
     }
     trace("sin runtime de solid: el panel lateral no se dibujara")
     return null
@@ -365,15 +384,32 @@ async function setupInner(context) {
         panelSlot = null
       }
       if (!solid) return
+      // El render tiene que devolver un COMPONENTE, no un elemento: el
+      // contexto de Solid solo existe dentro del arbol que dibuja OpenTUI.
+      // Es el mismo patron que usa el panel del plugin de Whisper
+      // (`_$createComponent(VoicePanel, {})`).
+      const Panel = () => {
+        const el = solid.createElement("text")
+        solid.insert(el, () => panelText)
+        return el
+      }
       panelSlot = context.ui.slot({
         append: "sidebar.content",
         render: () => {
-          // Un elemento nuevo en cada registro: `panelText` es una variable
-          // normal (no una senal), asi que el texto insertado se quedaria
-          // congelado si se reutilizara el mismo elemento.
-          const el = solid.createElement("text")
-          solid.insert(el, () => panelText)
-          return el
+          try {
+            return solid.createComponent(Panel, {})
+          } catch (err) {
+            fallosDeSlot++
+            trace("el panel lateral ha fallado:", errText(err))
+            // A la tercera se desregistra: si no, OpenCode repite el error en
+            // bucle ("opencode-voice-tts/tui crashed in slot sidebar").
+            if (fallosDeSlot >= 3 && panelSlot) {
+              trace("el panel lateral se desregistra tras 3 fallos")
+              panelSlot()
+              panelSlot = null
+            }
+            return null
+          }
         },
       })
     } catch (err) {

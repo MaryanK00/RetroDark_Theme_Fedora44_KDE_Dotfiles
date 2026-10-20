@@ -682,6 +682,31 @@ watcher**, con lo que la mitad de terminal dejaba de recargarse sola. Ahora
 `install.sh` comprueba el enlace antes de tocarlo, asi que instalarlo ya no
 rompe nada.
 
+#### El runtime de Solid: por que el panel necesita un enlace
+
+El panel lateral se dibuja con el runtime de Solid (`@opentui/solid`), igual
+que hace el plugin de Whisper. Y para que funcione tiene que ser **la misma
+instancia** que usa el TUI: si el plugin importa otra copia, su contexto de
+Solid es otro distinto y el `<text>` revienta al dibujarse.
+
+De ahi `scripts/link-voice-solid.sh`, que enlaza al `node_modules` del plugin
+local (`files/config/opencode/plugins/opencode-voice-tts/node_modules/`, que
+**no se versiona**) la copia de `@opentui/solid`, `@opentui/core` y `solid-js`
+que tiene el plugin de Whisper en la cache de npm de OpenCode. Con ese
+enlace, el especificador `"@opentui/solid"` resuelve a la misma ruta y Bun
+reutiliza la instancia ya cargada.
+
+`install-voice.sh` lo llama en cada instalacion, porque OpenCode reinstala los
+plugins con un hash nuevo y suelta el enlace.
+
+#### El panel lateral no puede fallar en bucle
+
+El `render` del slot va envuelto en un `try/catch`: si revienta, se avisa por
+la traza y, a la tercera vez, **el slot se desregistra**. Sin ese guardia
+OpenCode repite el error sin parar ("opencode-voice-tts/tui crashed in slot
+sidebar"). La puerta lo comprueba: `scripts/test-voice-tui.mjs` incluye una
+comprobacion con el runtime de Solid roto a proposito.
+
 #### Limitacion: `context.storage` en la mitad TUI
 
 El namespace de storage se deriva del ID del plugin, y el de la mitad TUI de

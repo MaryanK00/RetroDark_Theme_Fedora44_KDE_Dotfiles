@@ -5,6 +5,9 @@ rendered/
 # se generan en local con scripts/make-sounds.sh
 files/config/opencode/sounds/*.wav
 
+# runtime de Solid enlazado al plugin de voz (lo crea install-voice.sh)
+files/config/opencode/plugins/opencode-voice-tts/node_modules/
+
 # respaldos
 *.bak
 *.orig

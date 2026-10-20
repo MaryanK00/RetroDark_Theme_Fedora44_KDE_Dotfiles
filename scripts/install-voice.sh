@@ -170,6 +170,16 @@ else
     log "  no se pudo aplicar ahora; se reintentara en la proxima instalacion"
 fi
 
+# ------------------------------------------- runtime de Solid para el panel
+# El panel lateral necesita el MISMO runtime de Solid que usa el TUI. Se
+# enlaza al node_modules del plugin local (no se versiona: va al .gitignore).
+log "enlazando el runtime de solid al plugin de voz..."
+if bash "$(dirname "$0")/link-voice-solid.sh" 2>&1 | sed "s/^/  /"; then
+    :
+else
+    log "  no se pudo enlazar ahora; el panel lateral no se dibujara"
+fi
+
 # ---------------------------------------------------------------- prueba
 log "probando..."
 if ! echo "prueba de voz" | "$PIPER_BIN" -m "$VOICE_FILE" --output_raw > /dev/null 2>&1; then
