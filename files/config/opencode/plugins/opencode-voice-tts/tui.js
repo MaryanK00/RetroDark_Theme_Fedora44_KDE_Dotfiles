@@ -239,9 +239,11 @@ async function setupInner(context) {
   let draftOpen = false
 
   // ---- Panel lateral en vivo ---------------------------------------------
-  // Un slot en "sidebar.content" que dibuja el estado de la voz. Devuelve
-  // TEXTO PLANO: `JSX.Element` de Solid acepta un string, asi que no hace
-  // falta el runtime de Solid (que un plugin local no puede importar).
+  // Un slot en "sidebar.content" que dibuja el estado de la voz. El render
+  // tiene que devolver un ELEMENTO, no texto plano: un string suelto deja un
+  // nodo de texto sin padre ("Orphan text error"). Por eso se crea un <text>
+  // de verdad con el runtime de Solid, que se importa por ruta absoluta desde
+  // la cache de npm (un plugin local no puede resolver "@opentui/solid").
   //
   // OJO: `context.storage.store` tampoco se puede usar desde la mitad TUI de
   // un plugin local: el namespace se deriva del ID del plugin y el de la
@@ -256,7 +258,6 @@ async function setupInner(context) {
   const METER_WIDTH = 12
   let panelText = ""
   let panelSlot = null
-  let panelEl = null
   let solid = null
   let lastPhase = ""
   let levels = []
@@ -277,13 +278,30 @@ async function setupInner(context) {
     if (solid) return solid
     const base = join(homedir(), ".cache/opencode/npm")
     const candidatos = []
-    try {
-      for (const paquete of readdirSync(base)) {
-        for (const sub of readdirSync(join(base, paquete))) {
-          const p = join(base, paquete, sub, "node_modules/@opentui/solid/index.bun.js")
-          if (existsSync(p)) candidatos.push(p)
-        }
+    // npm anida los paquetes con ambito:
+    // <cache>/npm/@scope/<nombre>@latest/<hash>/node_modules/... -> hay que
+    // buscar en profundidad; con dos niveles no se encuentra nada.
+    const buscar = (dir, profundidad) => {
+      if (profundidad > 4) return
+      let entradas = []
+      try {
+        entradas = readdirSync(dir, { withFileTypes: true })
+      } catch {
+        return
       }
+      for (const entrada of entradas) {
+        if (!entrada.isDirectory()) continue
+        const sub = join(dir, entrada.name)
+        const candidato = join(sub, "node_modules/@opentui/solid/index.bun.js")
+        if (existsSync(candidato)) {
+          candidatos.push(candidato)
+          continue
+        }
+        buscar(sub, profundidad + 1)
+      }
+    }
+    try {
+      buscar(base, 0)
     } catch (err) {
       trace("no se pudo leer la cache de npm:", errText(err))
     }
@@ -343,16 +361,16 @@ async function setupInner(context) {
         panelSlot()
         panelSlot = null
       }
-      panelEl = null
       if (!solid) return
       panelSlot = context.ui.slot({
         append: "sidebar.content",
         render: () => {
-          if (!panelEl) {
-            panelEl = solid.createElement("text")
-            solid.insert(panelEl, () => panelText)
-          }
-          return panelEl
+          // Un elemento nuevo en cada registro: `panelText` es una variable
+          // normal (no una senal), asi que el texto insertado se quedaria
+          // congelado si se reutilizara el mismo elemento.
+          const el = solid.createElement("text")
+          solid.insert(el, () => panelText)
+          return el
         },
       })
     } catch (err) {
