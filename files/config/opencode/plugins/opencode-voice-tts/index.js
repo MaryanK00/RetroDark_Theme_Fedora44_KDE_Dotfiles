@@ -564,6 +564,16 @@ export const OpencodeVoiceTTS = {
               recordStop: { input: { type: "object", additionalProperties: false } },
               transcribe: { input: { type: "object", additionalProperties: false } },
               draftSave: { input: { type: "object", additionalProperties: false } },
+              level: {
+                input: { type: "object", additionalProperties: false },
+                output: {
+                  type: "object",
+                  properties: { level: { type: "number" }, recording: { type: "boolean" } },
+                  required: ["level", "recording"],
+                  additionalProperties: false,
+                },
+                errors: {},
+              },
             },
             events: { result: {} },
           }
@@ -588,7 +598,16 @@ export const OpencodeVoiceTTS = {
               trace("capture test: grabando...")
               const start = await withTimeout(ctx.rpc(VoiceRpc).recordStart({}), 10000, "recordStart")
               trace("capture test: grabador", JSON.stringify(start))
-              await new Promise((r) => setTimeout(r, 3000))
+              // Mientras graba, el nivel de audio en vivo (lo usa el panel lateral).
+              for (let i = 0; i < 5; i++) {
+                await new Promise((r) => setTimeout(r, 500))
+                try {
+                  const lv = await withTimeout(ctx.rpc(VoiceRpc).level({}), 5000, "level")
+                  trace("capture test: nivel ->", JSON.stringify(lv))
+                } catch (e) {
+                  trace("capture test: nivel fallo ->", e?.message ?? e)
+                }
+              }
               const stop = await withTimeout(ctx.rpc(VoiceRpc).recordStop({}), 20000, "recordStop")
               trace("capture test: OK ->", JSON.stringify(stop))
               wavToTranscribe = stop.wav

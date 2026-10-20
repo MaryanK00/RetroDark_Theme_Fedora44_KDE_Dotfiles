@@ -125,6 +125,20 @@ const VoiceRpc = {
     draftSave: { input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, errors: {} },
     draftClear: { input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, errors: {} },
     status: { input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, errors: {} },
+    // Nivel de audio en vivo del microfono: {level: 0..1, recording: bool}.
+    // Lo usa el panel lateral para dibujar el medidor mientras se graba.
+    // OJO: el `output` tiene que declarar sus properties, si no el servidor
+    // responde "Expected never" y la llamada falla.
+    level: {
+      input: { type: "object", additionalProperties: false },
+      output: {
+        type: "object",
+        properties: { level: { type: "number" }, recording: { type: "boolean" } },
+        required: ["level", "recording"],
+        additionalProperties: false,
+      },
+      errors: {},
+    },
   },
   events: {
     result: {
@@ -223,18 +237,69 @@ async function setupInner(context) {
   // true mientras el borrador esta en el dialogo de revision
   let draftOpen = false
 
-  // ---- Indicador en la barra inferior: DESACTIVADO -----------------------
-  // No se registra ningun slot en la TUI a proposito. Un slot en
-  // "prompt.footer.status" que devuelve texto plano (y no un elemento JSX)
-  // rompia el pie de la terminal, y los emoticonos ademas descuadraban el
-  // ancho de la barra. El estado se comunica con avisos (toast) y con la
-  // paleta de comandos, que ya funcionan.
+  // ---- Panel lateral en vivo ---------------------------------------------
+  // Un slot en "sidebar.content" que dibuja el estado de la voz. Devuelve
+  // TEXTO PLANO: `JSX.Element` de Solid acepta un string, asi que no hace
+  // falta el runtime de Solid (que un plugin local no puede importar).
   //
   // OJO: `context.storage.store` tampoco se puede usar desde la mitad TUI de
   // un plugin local: el namespace se deriva del ID del plugin y el de la
   // mitad TUI es "<directorio>/tui", que lleva "/" -> OpenCode lo rechaza con
   // "Invalid storage segment" y ABORTA el setup (con lo que la capa de
-  // teclado se queda sin registrar).
+  // teclado se queda sin registrar). Por eso el estado vive en variables.
+  //
+  // El panel no se dibuja en el pie de la terminal (prompt.footer.status):
+  // ahi el texto plano descuadraba el ancho de la barra.
+
+  const BARS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+  const METER_WIDTH = 12
+  let panelText = ""
+  let panelSlot = null
+  let lastPhase = ""
+  let levels = []
+  let recStartedAt = 0
+  let localPhase = "idle" // idle | transcribing
+  let voiceEnabled = true
+  let presetName = "k2"
+
+  const meter = () => {
+    const cells = levels.slice(-METER_WIDTH)
+    let out = " ".repeat(Math.max(0, METER_WIDTH - cells.length))
+    for (const v of cells) {
+      const lvl = Math.round(Math.max(0, Math.min(1, v)) * (BARS.length - 1))
+      out += BARS[lvl]
+    }
+    return out
+  }
+
+  const idlePanel = () => (voiceEnabled ? "voz: " + presetName : "voz: silenciada")
+
+  /**
+   * Pinta el panel lateral. Solo vuelve a registrar el slot si el texto ha
+   * cambiado: el slot no es reactivo (sin Solid), asi que redibujar es
+   *registrar de nuevo. Si el texto no cambia, no se toca nada.
+   */
+  const drawPanel = (text) => {
+    if (text === panelText) return
+    const fase = text.startsWith("grabando") ? "grabando" : text.startsWith("transcribiendo") ? "transcribiendo" : "idle"
+    if (fase !== lastPhase) {
+      lastPhase = fase
+      trace("panel lateral:", fase)
+    }
+    panelText = text
+    try {
+      if (panelSlot) {
+        panelSlot()
+        panelSlot = null
+      }
+      panelSlot = context.ui.slot({
+        append: "sidebar.content",
+        render: () => panelText,
+      })
+    } catch (err) {
+      trace("panel lateral:", errText(err))
+    }
+  }
 
   const toast = (message, variant = "info") => {
     try {
@@ -246,6 +311,58 @@ async function setupInner(context) {
 
   const voiceRpc = () => context.client.rpc(VoiceRpc)
   const ttsRpc = () => context.client.rpc(TtsRpc)
+
+  // ---- Medidor en vivo ----------------------------------------------------
+  // Pregunta al servidor cada 200 ms si el microfono esta grabando y con que
+  // nivel. Asi el panel se enciende tanto si grabamos con nuestro atajo como
+  // si se graba con el atajo del otro plugin (el suyo muestra su propio
+  // panel, este muestra el nuestro).
+  const POLL_MS = 200
+  const IDLE_POLL_MS = 1000
+  let pollTimer = null
+  let pollBusy = false
+  let serverRecording = false
+  let lastPollAt = 0
+  let pollErrorLogged = false
+
+  const pollOnce = async () => {
+    if (pollBusy) return
+    // En reposo se pregunta menos: solo hace falta enterarse de que el
+    // microfono se ha puesto a grabar por otra via.
+    const ahora = Date.now()
+    if (!serverRecording && ahora - lastPollAt < IDLE_POLL_MS) return
+    lastPollAt = ahora
+    pollBusy = true
+    try {
+      const r = await withTimeout(voiceRpc().level({}), 4000, "level")
+      serverRecording = !!r?.recording
+      if (serverRecording) {
+        levels = [...levels, r.level ?? 0].slice(-METER_WIDTH)
+        if (!recStartedAt) recStartedAt = Date.now()
+        drawPanel("grabando " + Math.floor((Date.now() - recStartedAt) / 1000) + "s " + meter())
+      } else {
+        levels = []
+        recStartedAt = 0
+        drawPanel(localPhase === "transcribing" ? "transcribiendo..." : idlePanel())
+      }
+    } catch (err) {
+      // El servidor puede estar caido: no hay que romper la TUI por eso.
+      if (!pollErrorLogged) {
+        pollErrorLogged = true
+        trace("el medidor no pudo preguntar el nivel:", errText(err))
+      }
+    } finally {
+      pollBusy = false
+    }
+  }
+
+  const startPolling = () => {
+    if (pollTimer) return
+    pollTimer = setInterval(() => {
+      void pollOnce()
+    }, POLL_MS)
+    void pollOnce()
+  }
 
   /**
    * Suelta la custodia del audio de una transcripcion.
@@ -278,6 +395,7 @@ async function setupInner(context) {
       if (d.client && d.client !== CLIENT_ID) return
       const take = typeof d.take === "string" ? d.take : ""
       trace("evento result:", d.error ? "error=" + d.error : (d.text ?? "").slice(0, 80), "| take:", take || "(ninguno)")
+      localPhase = "idle"
       if (d.error) {
         toast("Transcripcion fallida: " + d.error, "error")
         return
@@ -365,6 +483,7 @@ async function setupInner(context) {
 
       recording = false
       const stopped = await withTimeout(voiceRpc().recordStop({}), 20000, "recordStop")
+      localPhase = "transcribing"
       const wav = stopped?.wav
       const seconds = stopped?.seconds ?? 0
       trace("grabacion detenida:", seconds, "s ->", wav)
@@ -376,6 +495,7 @@ async function setupInner(context) {
       await withTimeout(voiceRpc().transcribe({ wav, client: CLIENT_ID }), 20000, "transcribe")
     } catch (err) {
       recording = false
+      localPhase = "idle"
       trace("dictado fallo:", errText(err))
       toast("Dictado: " + errText(err), "error")
     } finally {
@@ -389,6 +509,8 @@ async function setupInner(context) {
       const st = await withTimeout(ttsRpc().status({}), 8000, "voice-tts.status")
       const next = !st?.enabled
       await withTimeout(ttsRpc().setEnabled({ enabled: next }), 8000, "voice-tts.setEnabled")
+      voiceEnabled = next
+      drawPanel(idlePanel())
       toast(next ? "Voz activada" : "Voz silenciada", next ? "success" : "info")
     } catch (err) {
       trace("toggle de voz fallo:", errText(err))
@@ -403,6 +525,8 @@ async function setupInner(context) {
       const i = presets.indexOf(st?.preset)
       const next = presets[(i + 1) % presets.length] ?? st?.preset
       await withTimeout(ttsRpc().setPreset({ preset: next }), 8000, "voice-tts.setPreset")
+      presetName = next
+      drawPanel(idlePanel())
       toast("Voz: " + next, "success")
     } catch (err) {
       trace("cambio de preset fallo:", errText(err))
@@ -599,6 +723,8 @@ async function setupInner(context) {
       try {
         const st = await withTimeout(ttsRpc().status({}), 5000, "voice-tts.status")
         trace("rpc voice-tts status:", JSON.stringify(st))
+        if (st && typeof st.enabled === "boolean") voiceEnabled = st.enabled
+        if (st?.preset) presetName = st.preset
         try {
           const vst = await withTimeout(voiceRpc().status({}), 5000, "voice.status")
           trace("rpc voice status:", JSON.stringify(vst))
@@ -612,10 +738,19 @@ async function setupInner(context) {
     }
   }
   void selfCheck()
+  startPolling()
 
   return () => {
     try {
       offDirect?.()
+    } catch {}
+    try {
+      if (pollTimer) clearInterval(pollTimer)
+      pollTimer = null
+    } catch {}
+    try {
+      if (panelSlot) panelSlot()
+      panelSlot = null
     } catch {}
     trace("cleanup")
   }

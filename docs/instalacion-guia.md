@@ -489,9 +489,9 @@ Detalles que no son evidentes:
 ### Dictado
 
 El dictado lo aporta `@juliuskb/opencode-voice`: el motor Whisper y el
-microfono. **Pero su mitad de terminal esta rota** (ver "Por que los atajos del
-keymap no disparaban" mas abajo), asi que el atajo lo pone **nuestro propio
-plugin** (`opencode-voice-tts`, mitad TUI), que habla con el motor de Whisper a
+microfono. **Su atajo no llega** (ver "Por que los atajos del keymap no
+disparaban" mas abajo), asi que el atajo lo pone **nuestro propio plugin**
+(`opencode-voice-tts`, mitad TUI), que habla con el motor de Whisper a
 traves del RPC `voice` del otro plugin.
 
 | Tecla | Que hace |
@@ -526,6 +526,31 @@ El micro **no esta abierto nunca**: solo se abre entre dos pulsaciones. El
 plugin de Whisper lo ejecuta bajo un watchdog que lo mata si OpenCode muere, y
 barre grabadores huerfanos al arrancar. Al terminar, se abre un **borrador
 editable** con lo que dijo el micro: `Enter` lo envia, `Esc` lo descarta.
+
+#### El panel lateral de voz
+
+En la barra lateral (a la derecha) aparece nuestro propio panel:
+
+```
+voz: k2
+```
+
+y mientras se graba, en su lugar:
+
+```
+grabando 3s ▁▂▃▅▇▅▃▂▁
+```
+
+El medidor se alimenta del RPC `level` del plugin de Whisper (nivel RMS de los
+ultimos ~100 ms de audio). Se consulta cada 200 ms mientras hay grabacion y
+cada 1 s en reposo, asi que **tambien se enciende si grabas con el atajo del
+otro plugin**, no solo con el nuestro.
+
+El panel es un slot en `sidebar.content` que devuelve **texto plano**: un
+`JSX.Element` de Solid admite un `string`, asi que no hace falta importar el
+runtime de Solid (que un plugin local no puede resolver). Como no hay
+reactividad sin Solid, cuando el texto cambia se **vuelve a registrar** el slot
+(`context.ui.slot` devuelve la funcion para desregistrar).
 
 #### La custodia del audio (y por que se trababa el dictado)
 
@@ -618,10 +643,22 @@ del modulo y se refleja en la traza. El estado persistente de la voz
 (silenciada o no, y el timbre) lo guarda **la mitad servidor**, que si tiene
 un ID de plugin valido.
 
-Por la misma razon **no hay indicador en la barra inferior**: un slot tiene que
-devolver JSX, no texto plano, y un plugin local no puede importar el runtime
-de Solid. El estado se ve en los avisos (toast) que salen al pulsar los
-atajos.
+Por la misma razon **no hay indicador en la barra inferior** (el pie de la
+terminal): ahi el texto plano descuadraba el ancho de la barra. El estado se ve
+en los avisos (toast) que salen al pulsar los atajos y en el **panel lateral**
+(ver "El panel lateral de voz").
+
+#### Cambiar la mitad TUI: hay que reiniciar el terminal
+
+El watcher de OpenCode vigila el **entrypoint** del plugin (`index.js`), no el
+fichero `tui.js`. Ademas, una "reconciliacion" solo vuelve a importar el
+plugin si su entrypoint ha cambiado. Traducido: **cambiar `tui.js` no se ve
+hasta que se reinicia el terminal** (o hasta que se toca `index.js` *y* cambia
+la configuracion renderizada).
+
+Instalar los dotfiles (`./install.sh`) reescribe siempre la configuracion
+renderizada, asi que a veces basta con eso, pero no es fiable: si el contenido
+no cambia, no hay evento y la mitad TUI se queda vieja.
 
 Los modelos se descargan de los releases de `k2-fsa/sherpa-onnx` y
 se guardan en `~/.local/share/opencode-voice/models/`.
