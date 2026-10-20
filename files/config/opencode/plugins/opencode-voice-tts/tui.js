@@ -122,6 +122,8 @@ const VoiceRpc = {
     recordStop: { input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, errors: {} },
     recordCancel: { input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, errors: {} },
     transcribe: { input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, errors: {} },
+    draftSave: { input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, errors: {} },
+    draftClear: { input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, errors: {} },
     status: { input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, errors: {} },
   },
   events: {
@@ -218,6 +220,8 @@ async function setupInner(context) {
   let recording = false
   let busy = false
   let lastSessionID = null
+  // true mientras el borrador esta en el dialogo de revision
+  let draftOpen = false
 
   // ---- Indicador en la barra inferior: DESACTIVADO -----------------------
   // No se registra ningun slot en la TUI a proposito. Un slot en
@@ -243,6 +247,28 @@ async function setupInner(context) {
   const voiceRpc = () => context.client.rpc(VoiceRpc)
   const ttsRpc = () => context.client.rpc(TtsRpc)
 
+  /**
+   * Suelta la custodia del audio de una transcripcion.
+   *
+   * El motor de Whisper guarda el audio de la ultima transcripcion y bloquea
+   * el siguiente dictado hasta que el cliente confirme el borrador con
+   * `draftSave({text, take})`. El `take` es el token que llega en el evento
+   * `result`. Sin esta llamada, el segundo dictado falla con:
+   *   "The previous take is not in a draft yet - press the restore key"
+   *
+   * @param {string} take  token de custodia ("" si no lo hay)
+   * @param {string} text  texto final; "" si el usuario lo descarto
+   */
+  const releaseTake = async (take, text) => {
+    if (!take) return
+    try {
+      await withTimeout(voiceRpc().draftSave({ text: text ?? "", take }), 15000, "draftSave")
+      trace("custodia liberada:", take)
+    } catch (err) {
+      trace("NO se pudo liberar la custodia:", errText(err))
+    }
+  }
+
   // ---- Resultado de la transcripcion -------------------------------------
   // El servidor devuelve el texto por el evento RPC "result", no por el
   // valor de retorno de transcribe().
@@ -250,48 +276,63 @@ async function setupInner(context) {
     const off = voiceRpc().events.on("result", async (event) => {
       const d = event?.data ?? {}
       if (d.client && d.client !== CLIENT_ID) return
-      trace("evento result:", d.error ? "error=" + d.error : (d.text ?? "").slice(0, 80))
+      const take = typeof d.take === "string" ? d.take : ""
+      trace("evento result:", d.error ? "error=" + d.error : (d.text ?? "").slice(0, 80), "| take:", take || "(ninguno)")
       if (d.error) {
         toast("Transcripcion fallida: " + d.error, "error")
         return
       }
       const text = String(d.text ?? "").trim()
       if (!text) {
+        // Sin texto el servidor no abre custodia, asi que no hay nada que soltar.
         toast("No se oyo nada", "warning")
         return
       }
       // Borrador editable: se abre un dialogo con el texto ya puesto.
       let final = text
+      let discarded = false
+      draftOpen = true
       try {
         const edited = await context.ui.dialog.prompt({
           title: "Dictado",
           description: "Revisa el texto. Enter envia, Esc descarta.",
           value: text,
         })
-        if (edited === undefined) {
-          toast("Dictado descartado", "info")
-          return
-        }
-        final = String(edited).trim()
+        if (edited === undefined) discarded = true
+        else final = String(edited).trim()
       } catch (err) {
         trace("dialogo fallo, se envia el texto tal cual:", errText(err))
+      } finally {
+        draftOpen = false
       }
-      if (!final) {
+      if (!final) discarded = true
+
+      if (!discarded) {
+        const route = context.ui.router.current()
+        const sessionID = route?.type === "session" ? route.sessionID : lastSessionID
+        if (!sessionID) {
+          toast("No hay una conversacion a la que enviarlo", "error")
+        } else {
+          try {
+            await withTimeout(context.client.session.prompt({ sessionID, text: final }), 30000, "session.prompt")
+            trace("dictado enviado:", final.length, "caracteres")
+          } catch (err) {
+            toast("No se pudo enviar: " + errText(err), "error")
+          }
+        }
+      } else {
         toast("Dictado descartado", "info")
-        return
       }
-      const route = context.ui.router.current()
-      const sessionID = route?.type === "session" ? route.sessionID : lastSessionID
-      if (!sessionID) {
-        toast("No hay una conversacion a la que enviarlo", "error")
-        return
-      }
-      try {
-        await withTimeout(context.client.session.prompt({ sessionID, text: final }), 30000, "session.prompt")
-        trace("dictado enviado:", final.length, "caracteres")
-      } catch (err) {
-        toast("No se pudo enviar: " + errText(err), "error")
-      }
+
+      // ---- Soltar la custodia del audio (OBLIGATORIO) ----------------------
+      // Tras una transcripcion con texto, el servidor guarda el audio y
+      // bloquea el siguiente dictado hasta que el cliente confirme el
+      // borrador con draftSave({text, take}). Si no se hace, el siguiente
+      // intento falla con:
+      //   "The previous take is not in a draft yet - press the restore key"
+      // El texto se guarda como copia de seguridad; al descartarlo se
+      // guarda vacio para que no quede nada pendiente.
+      await releaseTake(take, discarded ? "" : final)
     })
     trace("escuchando el evento result")
     void off
@@ -302,6 +343,13 @@ async function setupInner(context) {
   // ---- Dictado: grabar / parar ------------------------------------------
   const toggleDictation = async () => {
     if (busy) return
+    // Con un borrador a medio revisar, el servidor sigue guardando el audio
+    // de la take anterior y rechazaria una nueva grabacion. Se espera a que
+    // el usuario envie o descarte el borrador.
+    if (draftOpen) {
+      toast("Hay un dictado pendiente de revisar", "info")
+      return
+    }
     busy = true
     try {
       const route = context.ui.router.current()

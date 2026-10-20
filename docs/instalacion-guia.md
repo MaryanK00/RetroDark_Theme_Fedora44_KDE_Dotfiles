@@ -527,6 +527,37 @@ plugin de Whisper lo ejecuta bajo un watchdog que lo mata si OpenCode muere, y
 barre grabadores huerfanos al arrancar. Al terminar, se abre un **borrador
 editable** con lo que dijo el micro: `Enter` lo envia, `Esc` lo descarta.
 
+#### La custodia del audio (y por que se trababa el dictado)
+
+El motor de Whisper guarda en disco el audio de la ultima transcripcion, por
+si el texto se pierde. A cambio, **bloquea el siguiente dictado** hasta que el
+cliente confirma que el borrador ya esta a salvo. Ese aviso llega en el evento
+RPC `result` como un token `take`, y se devuelve con `draftSave({text, take})`.
+
+Si esa confirmacion se pierde (el TUI se reinicio a medias, el dialogo se
+cerro de golpe, ...), el token se queda en memoria del servidor y el siguiente
+dictado falla con:
+
+```
+The previous take is not in a draft yet - press the restore key to recover it
+```
+
+Nuestro plugin lo evita guardando el `take` de cada transcripcion y soltando
+la custodia en cuanto el borrador se envia o se descarta. Si aun asi se traba
+(el token se perdio al reiniciar el TUI), hay un comando de rescate:
+
+```
+/voice-reset
+```
+
+Desactiva y vuelve a activar la red de seguridad, que es la unica forma de
+liberar el token sin tenerlo delante. Ojo: eso borra el audio y el borrador de
+recuperacion que hubiera guardados.
+
+Mientras el borrador esta en el dialogo de revision, la tecla de dictado no
+hace nada (avisa de que hay un dictado pendiente): el servidor rechazaria una
+grabacion nueva.
+
 #### Por que los atajos del keymap no disparaban
 
 Ni `F9` ni el resto de atajos del keymap llegaban a ejecutarse. Es un fallo en

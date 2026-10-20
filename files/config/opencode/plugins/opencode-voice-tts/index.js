@@ -563,6 +563,7 @@ export const OpencodeVoiceTTS = {
               recordStart: { input: { type: "object", additionalProperties: false } },
               recordStop: { input: { type: "object", additionalProperties: false } },
               transcribe: { input: { type: "object", additionalProperties: false } },
+              draftSave: { input: { type: "object", additionalProperties: false } },
             },
             events: { result: {} },
           }
@@ -570,6 +571,15 @@ export const OpencodeVoiceTTS = {
             const off = ctx.rpc(VoiceRpc).events.on("result", (ev) => {
               const d = ev?.data ?? {}
               trace("capture test: resultado ->", JSON.stringify(d).slice(0, 400))
+              // Suelta la custodia del audio: si no, el siguiente dictado
+              // queda bloqueado con "the previous take is not in a draft yet".
+              const take = typeof d.take === "string" ? d.take : ""
+              if (take) {
+                ctx.rpc(VoiceRpc)
+                  .draftSave({ text: String(d.text ?? ""), take })
+                  .then(() => trace("capture test: custodia liberada"))
+                  .catch((e) => trace("capture test: no se pudo liberar la custodia:", e?.message ?? e))
+              }
             })
             // Si se pasa una ruta, se transcribe esa; si no, se graba el micro.
             const given = String(input?.prompt?.text ?? "").trim()
@@ -590,6 +600,48 @@ export const OpencodeVoiceTTS = {
             off?.()
           } catch (err) {
             trace("capture test: FALLO ->", err?.message ?? String(err))
+          }
+        },
+      })
+
+      // Libera un dictado atascado.
+      //
+      // El motor de Whisper guarda el audio de la ultima transcripcion y
+      // bloquea el siguiente dictado hasta que el cliente confirme el
+      // borrador (draftSave con el token "take"). Si esa confirmacion se
+      // pierde (el TUI se reinicio, el dialogo se cerro de golpe...), el
+      // dictado queda atascado con:
+      //   "The previous take is not in a draft yet - press the restore key"
+      //
+      // El token solo vive en memoria del servidor, asi que la unica forma de
+      // liberarlo sin el es desactivar la red de seguridad y volver a
+      // activarla: al desactivarla el servidor suelta la custodia.
+      editor.add({
+        name: "voice-reset",
+        description: "Libera un dictado atascado (resetea la custodia del audio)",
+        execute: async (input) => {
+          const VoiceRpc = {
+            id: "voice",
+            methods: {
+              settingsSet: { input: { type: "object", additionalProperties: false } },
+            },
+            events: {},
+          }
+          try {
+            await withTimeout(
+              ctx.rpc(VoiceRpc).settingsSet({ json: JSON.stringify({ safetyNet: false }) }),
+              10000,
+              "settingsSet",
+            )
+            await withTimeout(
+              ctx.rpc(VoiceRpc).settingsSet({ json: JSON.stringify({ safetyNet: true }) }),
+              10000,
+              "settingsSet",
+            )
+            trace("comando /voice-reset -> custodia liberada")
+            await say(input.sessionID, "Voz reseteada. Ya puedes dictar.")
+          } catch (err) {
+            trace("comando /voice-reset -> FALLO:", err?.message ?? String(err))
           }
         },
       })

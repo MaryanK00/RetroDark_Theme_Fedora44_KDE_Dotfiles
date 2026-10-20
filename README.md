@@ -198,9 +198,10 @@ Lo esencial:
   y sin salir de la máquina. Atajos: `ctrl+space` o `alt+d` para dictar,
   `ctrl+alt+m` para silenciar la lectura y `ctrl+alt+t` para cambiar de
   timbre. Comandos: `/speak` (silencia o activa), `/voice` (cambia el preset:
-  `k2`, `e4`, `j1`, `plain`), `/voice-test` y `/voice-capture-test` (prueba
-  del micro y de Whisper). El binario y los modelos no se versionan:
-  `./scripts/install-voice.sh` los deja listos.
+  `k2`, `e4`, `j1`, `plain`), `/voice-test`, `/voice-capture-test` (prueba
+  del micro y de Whisper) y `/voice-reset` (libera un dictado atascado). El
+  binario y los modelos no se versionan: `./scripts/install-voice.sh` los
+  deja listos.
 
 El detalle completo —incluido el coste en contexto de cada servidor MCP, por
 qué se usa el paquete de npm en lugar del binario oficial de GitHub, y cómo
