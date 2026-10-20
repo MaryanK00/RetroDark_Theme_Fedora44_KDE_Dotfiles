@@ -44,6 +44,7 @@ function check(nombre, ok, detalle = "") {
 const slots = []
 const layers = []
 const rpcCalls = []
+const teclas = []
 
 function fakeRpc(definition) {
   const methods = {
@@ -79,7 +80,12 @@ const mock = {
     },
   },
   renderer: {
-    keyInput: { on: () => {}, off: () => {} },
+    keyInput: {
+      on: (_evento, manejador) => {
+        teclas.push(manejador)
+      },
+      off: () => {},
+    },
     prependInputHandler: () => {},
     removeInputHandler: () => {},
   },
@@ -101,6 +107,21 @@ const mock = {
     toast: { show: () => {} },
     dialog: { prompt: async () => undefined },
     router: { current: () => ({ type: "home" }), register: () => () => {} },
+    tabs: {
+      enabled: () => true,
+      list: () => [
+        { sessionID: "ses_activa", active: true },
+        { sessionID: "ses_otra", active: false },
+      ],
+    },
+  },
+  data: {
+    session: {
+      list: () => [
+        { id: "ses_reciente", time: { updated: 2000 } },
+        { id: "ses_antigua", time: { updated: 1000 } },
+      ],
+    },
   },
 }
 
@@ -191,6 +212,29 @@ check(
   "el panel roto se desregistra a la tercera",
   panelRoto?.desregistrado === true,
   panelRoto?.desregistrado ? "desregistrado" : "sigue registrado",
+)
+
+// 3c. el dictado tiene que ir a la sesion que esta activa.
+// Antes el destino era "la ultima sesion conocida", que tras un /new es la
+// conversacion ANTERIOR: el texto se iba a la ventana equivocada.
+const atajo = teclas[0]
+if (atajo) {
+  atajo({ name: "space", ctrl: true, meta: false, shift: false })
+  await new Promise((r) => setTimeout(r, 300))
+}
+const trazaDestino = await (await import("node:fs/promises")).readFile(
+  join(fakeHome, ".local/share/opencode/voice-tui.log"),
+  "utf8",
+)
+check(
+  "el dictado va a la pestana activa",
+  /sesion de destino: pestana activa -> ses_activa/.test(trazaDestino),
+  trazaDestino.split("\n").filter((l) => l.includes("destino")).join(" | "),
+)
+check(
+  "el dictado no cae en la ultima sesion conocida",
+  !/sesion de destino: la ultima conocida/.test(trazaDestino),
+  trazaDestino.split("\n").filter((l) => l.includes("destino")).join(" | "),
 )
 
 // 4. los atajos se leen del fichero

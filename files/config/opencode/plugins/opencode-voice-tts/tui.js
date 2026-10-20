@@ -55,8 +55,21 @@ const DEFAULT_SHORTCUTS = {
 
 /** Cache de atajos: se relee solo cuando cambia el mtime del fichero. */
 let shortcutsCache = null
+/** El fichero de atajos tal cual, para leer opciones que no son atajos. */
+let rawShortcuts = null
 let shortcutsMtime = 0
 let shortcutsCheckedAt = 0
+
+/**
+ * ¿Se dibuja el panel lateral?
+ *
+ * El panel necesita el runtime de Solid y, si algo va mal, es mejor quedarse
+ * con los avisos que ver el terminal lleno de errores. Se apaga poniendo
+ * {"panel": false} en el fichero de atajos.
+ */
+function panelActivo() {
+  return rawShortcuts?.panel !== false
+}
 
 /**
  * Lee los atajos del fichero del usuario.
@@ -72,6 +85,7 @@ function loadShortcuts() {
       writeFileSync(SHORTCUTS_FILE, JSON.stringify(DEFAULT_SHORTCUTS, null, 2) + "\n")
       trace("atajos: fichero creado con los valores por defecto")
       shortcutsCache = DEFAULT_SHORTCUTS
+      rawShortcuts = {}
       shortcutsMtime = 0
       return shortcutsCache
     }
@@ -93,6 +107,7 @@ function loadShortcuts() {
       out[action] = clean.length > 0 ? clean : fallback
     }
     shortcutsCache = out
+    rawShortcuts = raw
     shortcutsMtime = mtime
     trace("atajos cargados:", JSON.stringify(out))
     return out
@@ -384,6 +399,10 @@ async function setupInner(context) {
         panelSlot = null
       }
       if (!solid) return
+      if (!panelActivo()) {
+        trace("el panel lateral esta apagado (panel: false en el fichero de atajos)")
+        return
+      }
       // El render tiene que devolver un COMPONENTE, no un elemento: el
       // contexto de Solid solo existe dentro del arbol que dibuja OpenTUI.
       // Es el mismo patron que usa el panel del plugin de Whisper
@@ -400,7 +419,7 @@ async function setupInner(context) {
             return solid.createComponent(Panel, {})
           } catch (err) {
             fallosDeSlot++
-            trace("el panel lateral ha fallado:", errText(err))
+            trace("el panel lateral ha fallado:", errText(err), "| stack:", err?.stack ?? "(sin stack)")
             // A la tercera se desregistra: si no, OpenCode repite el error en
             // bucle ("opencode-voice-tts/tui crashed in slot sidebar").
             if (fallosDeSlot >= 3 && panelSlot) {
@@ -423,6 +442,58 @@ async function setupInner(context) {
     } catch (err) {
       trace("toast fallo:", errText(err))
     }
+  }
+
+  /**
+   * Sesion a la que se envia el dictado.
+   *
+   * Tras un /new el TUI puede quedarse sin ruta de sesion, y si se usa la
+   * ultima sesion conocida el texto se va a la conversacion ANTERIOR. Por eso
+   * se consulta, en este orden:
+   *   1. la pestana activa,
+   *   2. la ruta actual,
+   *   3. la sesion mas reciente,
+   *   4. y solo como ultimo recurso, la ultima conocida.
+   */
+  const sesionDeDestino = () => {
+    try {
+      const pestanas = context.ui.tabs?.enabled?.() ? context.ui.tabs.list() : []
+      const activa = pestanas.find((t) => t?.active)
+      if (activa?.sessionID) {
+        trace("sesion de destino: pestana activa ->", activa.sessionID)
+        return activa.sessionID
+      }
+    } catch (err) {
+      trace("no se pudieron leer las pestanas:", errText(err))
+    }
+    try {
+      const route = context.ui.router.current()
+      if (route?.type === "session" && route.sessionID) {
+        trace("sesion de destino: ruta actual ->", route.sessionID)
+        return route.sessionID
+      }
+    } catch (err) {
+      trace("no se pudo leer la ruta:", errText(err))
+    }
+    try {
+      const sesiones = context.data.session.list() ?? []
+      const recientes = [...sesiones].sort(
+        (a, b) => (b?.time?.updated ?? 0) - (a?.time?.updated ?? 0),
+      )
+      const id = recientes[0]?.id ?? recientes[0]?.sessionID
+      if (id) {
+        trace("sesion de destino: la mas reciente ->", id)
+        return id
+      }
+    } catch (err) {
+      trace("no se pudo leer la lista de sesiones:", errText(err))
+    }
+    if (lastSessionID) {
+      trace("sesion de destino: la ultima conocida ->", lastSessionID)
+      return lastSessionID
+    }
+    trace("sesion de destino: ninguna")
+    return null
   }
 
   const voiceRpc = () => context.client.rpc(VoiceRpc)
@@ -542,8 +613,7 @@ async function setupInner(context) {
       if (!final) discarded = true
 
       if (!discarded) {
-        const route = context.ui.router.current()
-        const sessionID = route?.type === "session" ? route.sessionID : lastSessionID
+        const sessionID = sesionDeDestino()
         if (!sessionID) {
           toast("No hay una conversacion a la que enviarlo", "error")
         } else {
@@ -586,8 +656,8 @@ async function setupInner(context) {
     }
     busy = true
     try {
-      const route = context.ui.router.current()
-      if (route?.type === "session") lastSessionID = route.sessionID
+      const destino = sesionDeDestino()
+      if (destino) lastSessionID = destino
 
       // La verdad la tiene el servidor: si ya hay grabacion (la haya abierto
       // otra terminal) la paramos; si no, grabamos. Asi dos terminales
