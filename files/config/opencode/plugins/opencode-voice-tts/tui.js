@@ -389,6 +389,122 @@ async function setupInner(context) {
     }
   }
 
+  // ---- Mandar el dictado a traves del TUI (para respetar el modo) --------
+  //
+  // El modo (plan/build) y el modelo se eligen en el compositor, pero el TUI
+  // solo se los aplica al servidor cuando ENVIA el mensaje: justo antes
+  // llama a session.switchAgent y session.switchModel con lo elegido. Si el
+  // plugin manda el texto con session.prompt, el servidor usa el agente que
+  // tiene guardado en la sesion (el de antes) y el mensaje sale en plan
+  // aunque el usuario ya haya cambiado a build.
+  //
+  // El SDK de plugins no expone el agente que hay elegido, asi que la unica
+  // forma de que el modo se respete es que lo envie el TUI: el texto se pega
+  // en el compositor y se le pide su comando "prompt.submit".
+
+  /** El compositor (el textarea) que tiene el foco, si lo hay. */
+  const compositorConFoco = () => {
+    try {
+      const editor = context.renderer?.currentFocusedEditor
+      if (!editor || editor.isDestroyed) return null
+      return editor
+    } catch (err) {
+      trace("no se pudo leer el compositor:", errText(err))
+      return null
+    }
+  }
+
+  /**
+   * Espera a que el compositor recupere el foco.
+   *
+   * Al cerrarse el dialogo de revision, el TUI devuelve el foco al
+   * compositor (unos milisegundos despues), asi que hay que darle margen.
+   *
+   * Se espera a ESE compositor y no a cualquiera: mientras el dialogo se
+   * cierra, el textarea del propio dialogo tiene el foco y ahi el texto se
+   * perderia (ademas el dialogo ya lleva el texto dentro).
+   */
+  const esperarCompositor = async (editor, ms = 1500) => {
+    const limite = Date.now() + ms
+    while (Date.now() < limite) {
+      if (editor.isDestroyed) return null
+      try {
+        if (context.renderer?.currentFocusedEditor === editor) return editor
+      } catch {}
+      await new Promise((r) => setTimeout(r, 40))
+    }
+    return null
+  }
+
+  /** Espera a que el texto aparezca en el compositor. */
+  const esperarTextoPegado = async (editor, texto, ms = 1000) => {
+    const limite = Date.now() + ms
+    while (Date.now() < limite) {
+      if (String(editor.plainText ?? "").includes(texto)) return true
+      await new Promise((r) => setTimeout(r, 40))
+    }
+    return String(editor.plainText ?? "").includes(texto)
+  }
+
+  /** Espera a que el compositor se vacie: eso significa que el TUI lo mando. */
+  const esperarEnvio = async (editor, texto, ms = 4000) => {
+    const limite = Date.now() + ms
+    while (Date.now() < limite) {
+      if (!String(editor.plainText ?? "").includes(texto)) return true
+      await new Promise((r) => setTimeout(r, 60))
+    }
+    return !String(editor.plainText ?? "").includes(texto)
+  }
+
+  /**
+   * Pega el dictado en el compositor y deja que el TUI lo envie.
+   *
+   * Devuelve:
+   *   - {via:"tui"}     el TUI lo ha enviado (se respeta el modo elegido)
+   *   - {via:"manual"}  el texto esta en el compositor, pero le toca al
+   *                     usuario darle a Enter
+   *   - {via:"directo"} no hay compositor: hay que mandarlo a pelo
+   */
+  const enviarDictadoPorElTUI = async (texto, compositor) => {
+    if (!compositor) {
+      trace("no habia compositor antes del dialogo, se mandaria directo")
+      return { via: "directo", motivo: "no hay compositor con foco" }
+    }
+    const editor = await esperarCompositor(compositor)
+    if (!editor) {
+      trace("el compositor no recupero el foco, se mandaria directo")
+      return { via: "directo", motivo: "el compositor no recupero el foco" }
+    }
+    const previo = String(editor.plainText ?? "")
+    const vacio = previo.trim().length === 0
+    // El pegado va al cursor: se lleva al final para no partir lo que haya.
+    try {
+      editor.gotoBufferEnd?.()
+    } catch {}
+    const contenido = vacio ? texto : previo.endsWith("\n") ? texto : "\n" + texto
+    try {
+      context.renderer.keyInput.processPaste(new TextEncoder().encode(contenido))
+    } catch (err) {
+      trace("no se pudo pegar en el compositor:", errText(err))
+      return { via: "directo", motivo: "no se pudo pegar en el compositor" }
+    }
+    if (!(await esperarTextoPegado(editor, texto))) {
+      trace("el texto no llego al compositor")
+      return { via: "directo", motivo: "el texto no llego al compositor" }
+    }
+    // En modo shell el TUI ejecuta el texto como comando, no lo manda como
+    // mensaje: ahi no se autoenvia, que le de al usuario a Enter.
+    const shell = String(editor.traits?.status ?? "") === "SHELL"
+    trace("compositor:", vacio ? "vacio" : "con texto", "| shell:", shell ? "si" : "no")
+    if (!vacio) return { via: "manual", motivo: "el compositor ya tenia texto" }
+    if (shell) return { via: "manual", motivo: "el compositor esta en modo shell" }
+    // El TUI aplica el modo (plan/build) y el modelo elegidos y manda el
+    // mensaje (creando la conversacion si hace falta).
+    context.keymap.dispatch("prompt.submit")
+    if (await esperarEnvio(editor, texto)) return { via: "tui" }
+    return { via: "manual", motivo: "el texto sigue en el compositor" }
+  }
+
   const voiceRpc = () => context.client.rpc(VoiceRpc)
   const ttsRpc = () => context.client.rpc(TtsRpc)
 
@@ -442,6 +558,11 @@ async function setupInner(context) {
       // Borrador editable: se abre un dialogo con el texto ya puesto.
       let final = text
       let discarded = false
+      // El compositor que tiene el foco AHORA: al cerrarse el dialogo, el TUI
+      // le devuelve el foco y es ahi donde hay que pegar el texto. Si el
+      // usuario no estaba escribiendo (esta en la lista de conversaciones,
+      // por ejemplo), no hay compositor y el texto se manda a pelo.
+      const compositor = compositorConFoco()
       draftOpen = true
       try {
         const edited = await context.ui.dialog.prompt({
@@ -460,15 +581,30 @@ async function setupInner(context) {
 
       if (!discarded) {
         try {
-          let sessionID = sesionDeDestino()
-          if (!sessionID) {
-            // No hay ninguna conversacion abierta (pantalla de inicio o /new):
-            // se abre una nueva y se navega a ella, como hace el TUI cuando
-            // escribes un mensaje a mano desde el inicio.
-            sessionID = await crearSesionDestino()
-            await abrirSesion(sessionID)
+          // El texto se le pasa al TUI para que lo envie el: asi se aplican el
+          // modo (plan/build) y el modelo que hay elegidos en el compositor.
+          const envio = await enviarDictadoPorElTUI(final, compositor)
+          if (envio.via === "tui") {
+            trace("dictado enviado por el TUI (respeta el modo)")
+          } else if (envio.via === "manual") {
+            toast(
+              "Dictado pegado en el compositor (" + envio.motivo + "). Pulsa Enter para enviarlo.",
+              "info",
+            )
+          } else {
+            // Sin compositor no hay modo que respetar: se manda a la sesion de
+            // la pantalla con el agente que tenga guardado.
+            let sessionID = sesionDeDestino()
+            if (!sessionID) {
+              // No hay ninguna conversacion abierta (pantalla de inicio o /new):
+              // se abre una nueva y se navega a ella, como hace el TUI cuando
+              // escribes un mensaje a mano desde el inicio.
+              sessionID = await crearSesionDestino()
+              await abrirSesion(sessionID)
+            }
+            await enviarDictado(sessionID, final)
+            toast("Enviado con el modo de la conversacion (no habia compositor)", "warning")
           }
-          await enviarDictado(sessionID, final)
         } catch (err) {
           toast("No se pudo enviar: " + errText(err), "error")
         }

@@ -7,12 +7,12 @@
  *
  *   1. `setup()` no lanza.
  *   2. Se registra la capa de teclado (los comandos de la paleta).
- *   3. Se registra el panel lateral y su texto es el esperado.
- *   4. Los atajos del fichero se leen bien.
- *
- * El punto 3 es el que habria pillado el bug de "idlePanel is not defined":
- * el error lo tragaba el `catch` del bucle de sondeo y el panel se quedaba en
- * blanco sin dar ningun error visible.
+ *   3. La traza no muestra ningun fallo del setup.
+ *   4. El destino del dictado es la conversacion que esta en pantalla, no una
+ *      anterior.
+ *   5. El dictado se pega en el compositor y lo manda el TUI: el TUI es quien
+ *      aplica el modo (plan/build) y el modelo que tiene elegidos el usuario,
+ *      asi que es la unica forma de que el mensaje salga en el modo actual.
  *
  * Se ejecuta con un HOME de mentira, asi que no toca ni la traza real ni el
  * fichero de atajos del usuario.
@@ -54,9 +54,33 @@ const rpcHandlers = new Map()
 const createCalls = []
 const promptCalls = []
 const navegaciones = []
+// Los comandos que el plugin pide al keymap (por ejemplo "prompt.submit").
+const dispatches = []
+// Lo que el TUI manda cuando el plugin le dice que envie: el agente que
+// tiene elegido el usuario en el compositor es lo que se aplica.
+const enviosTui = []
 // La ruta que ve el TUI. Cambia entre escenarios (con conversacion abierta /
 // en la pantalla de inicio).
 let mockRoute = { type: "session", sessionID: "ses_actual" }
+// El compositor (textarea) con el foco. En el TUI de verdad es el mismo
+// textarea donde se escribe a mano.
+const compositor = {
+  texto: "",
+  traits: {},
+  isDestroyed: false,
+  get plainText() {
+    return this.texto
+  },
+  gotoBufferEnd() {},
+}
+// El textarea que tiene el foco ahora mismo. null = el usuario no esta
+// escribiendo (esta mirando la lista de conversaciones, por ejemplo).
+let editorConFoco = compositor
+// Si se pone, al cerrarse el dialogo el foco se va a ese textarea (como
+// pasa con el textarea del propio dialogo, que se destruye al cerrarse).
+let focoAlCerrarDialogo = null
+// El agente (plan/build) que el usuario tiene seleccionado en el compositor.
+let agenteElegido = "build"
 
 /** Lee el log de la traza del plugin. */
 async function leerTraza() {
@@ -114,6 +138,20 @@ const mock = {
     layer: (factory) => {
       layers.push(factory())
     },
+    // El plugin pide al TUI que envie el texto del compositor: el TUI aplica
+    // el agente elegido y manda el mensaje.
+    dispatch: (id) => {
+      dispatches.push(id)
+      if (id === "prompt.submit") {
+        enviosTui.push({
+          sessionID: mockRoute?.sessionID ?? null,
+          agent: agenteElegido,
+          texto: compositor.texto,
+        })
+        compositor.texto = ""
+      }
+    },
+    commands: () => [],
   },
   renderer: {
     keyInput: {
@@ -121,6 +159,14 @@ const mock = {
         teclas.push(manejador)
       },
       off: () => {},
+      // Pegar en el compositor que tiene el foco.
+      processPaste: (bytes) => {
+        if (!editorConFoco) return
+        editorConFoco.texto += new TextDecoder().decode(bytes)
+      },
+    },
+    get currentFocusedEditor() {
+      return editorConFoco
     },
     prependInputHandler: () => {},
     removeInputHandler: () => {},
@@ -143,7 +189,12 @@ const mock = {
     toast: { show: () => {} },
     // El dialogo devuelve el texto tal cual: como si el usuario pulsase
     // Enter sin tocarlo.
-    dialog: { prompt: async (opts) => opts?.value },
+    dialog: {
+      prompt: async (opts) => {
+        if (focoAlCerrarDialogo) editorConFoco = focoAlCerrarDialogo
+        return opts?.value
+      },
+    },
     router: {
       current: () => mockRoute,
       navigate: (destino) => {
@@ -268,14 +319,27 @@ check(
   lineasDestino,
 )
 
-// 3d. el texto se manda a la conversacion de la ruta.
+// 3d. el texto se pega en el compositor y lo manda el TUI.
+// El TUI es el unico que sabe que modo (plan/build) tiene elegido el
+// usuario, asi que el plugin no puede mandar el mensaje por su cuenta.
 const resultado = rpcHandlers.get("result")
 if (resultado) {
   await resultado({ data: { text: "hola desde el dictado", take: "take-1" } })
 }
 check(
-  "el texto se envia a la sesion de la ruta",
-  promptCalls.length === 1 && promptCalls[0]?.sessionID === "ses_actual",
+  "el texto se pega en el compositor",
+  enviosTui.length === 1 && enviosTui[0]?.texto?.includes("hola desde el dictado"),
+  JSON.stringify(enviosTui),
+)
+check("el plugin pide al TUI que envie", dispatches.includes("prompt.submit"), JSON.stringify(dispatches))
+check(
+  "lo envia el TUI con el agente elegido en el compositor",
+  enviosTui[0]?.agent === agenteElegido,
+  JSON.stringify(enviosTui),
+)
+check(
+  "el plugin NO manda el mensaje por su cuenta",
+  promptCalls.length === 0,
   JSON.stringify(promptCalls),
 )
 check(
@@ -284,14 +348,60 @@ check(
   JSON.stringify(createCalls),
 )
 
-// 3e. sin conversacion abierta (pantalla de inicio o /new) se abre una nueva.
+// 3e. en modo shell el TUI ejecuta el texto como comando: ahi no se autoenvia.
+compositor.traits = { status: "SHELL" }
+const antesShell = dispatches.length
+if (resultado) {
+  await resultado({ data: { text: "ls -la", take: "take-shell" } })
+}
+check(
+  "en modo shell no se autoenvia",
+  dispatches.length === antesShell,
+  JSON.stringify(dispatches),
+)
+check(
+  "en modo shell el texto queda en el compositor",
+  compositor.texto.includes("ls -la"),
+  compositor.texto,
+)
+
+// 3f. si el compositor ya tenia texto, no se manda solo: lo revisa el usuario.
+compositor.traits = {}
+compositor.texto = "texto previo"
+const antesConTexto = dispatches.length
+if (resultado) {
+  await resultado({ data: { text: "y mas cosas", take: "take-2" } })
+}
+check(
+  "con texto previo no se autoenvia",
+  dispatches.length === antesConTexto,
+  JSON.stringify(dispatches),
+)
+check(
+  "con texto previo se pega detras",
+  compositor.texto.includes("texto previo") && compositor.texto.includes("y mas cosas"),
+  compositor.texto,
+)
+
+// 3g. sin compositor con foco no hay modo que respetar: se manda a pelo a la
+// conversacion de la pantalla.
+compositor.texto = ""
+editorConFoco = null
+if (resultado) {
+  await resultado({ data: { text: "hola sin compositor", take: "take-3" } })
+}
+check(
+  "sin compositor el texto va a la sesion de la ruta",
+  promptCalls.length === 1 && promptCalls[0]?.sessionID === "ses_actual",
+  JSON.stringify(promptCalls),
+)
+
+// 3h. sin conversacion abierta (pantalla de inicio o /new) se abre una nueva.
 // El /new de OpenCode 2.1.1 NO crea sesion: deja el TUI en la pantalla de
 // inicio, y ahi el dictado tiene que abrir su propia conversacion.
 mockRoute = { type: "home" }
-await mod.default.setup(mock)
-const resultadoInicio = rpcHandlers.get("result")
-if (resultadoInicio) {
-  await resultadoInicio({ data: { text: "hola desde el inicio", take: "take-2" } })
+if (resultado) {
+  await resultado({ data: { text: "hola desde el inicio", take: "take-4" } })
 }
 check(
   "sin conversacion abierta se abre una",
@@ -312,6 +422,36 @@ check(
   "el TUI navega a la conversacion nueva",
   navegaciones.some((n) => n?.type === "session" && n?.sessionID === "ses_nueva"),
   JSON.stringify(navegaciones),
+)
+
+// 3i. si al cerrarse el dialogo el foco no vuelve al compositor, el texto no
+// se pega en ninguna otra parte: el textarea del dialogo se destruye al
+// cerrarse y ahi el texto se perderia. Se manda a pelo.
+const otro = {
+  texto: "",
+  traits: {},
+  isDestroyed: false,
+  get plainText() {
+    return this.texto
+  },
+  gotoBufferEnd() {},
+}
+editorConFoco = compositor
+focoAlCerrarDialogo = otro
+compositor.texto = ""
+const antesOtro = promptCalls.length
+if (resultado) {
+  await resultado({ data: { text: "hola con el foco perdido", take: "take-5" } })
+}
+check(
+  "si el foco no vuelve al compositor no se pega en otro sitio",
+  otro.texto === "" && compositor.texto === "",
+  "otro: " + otro.texto + " | compositor: " + compositor.texto,
+)
+check(
+  "si el foco no vuelve al compositor el texto se manda a pelo",
+  promptCalls.length === antesOtro + 1,
+  JSON.stringify(promptCalls),
 )
 
 // 4. los atajos se leen del fichero
