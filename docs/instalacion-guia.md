@@ -527,6 +527,34 @@ plugin de Whisper lo ejecuta bajo un watchdog que lo mata si OpenCode muere, y
 barre grabadores huerfanos al arrancar. Al terminar, se abre un **borrador
 editable** con lo que dijo el micro: `Enter` lo envia, `Esc` lo descarta.
 
+#### Si el dictado se duplica o el microfono se queda abierto
+
+Si al pulsar `ctrl+space` pasa cualquier cosa raro (dos dictados a la vez,
+"Already recording", el microfono que no se cierra), mira **cuantos procesos de
+terminal hay abiertos en la misma pestana**:
+
+```bash
+ps -eo pid,ppid,tty,cmd | grep -E "opencode$" | grep -v grep
+```
+
+Si hay **dos lineas con la misma `tty`**, son dos instancias leyendo del
+mismo teclado: cada pulsacion la procesan las dos y se pisan entre si (el
+motor de Whisper es uno solo y esta en el servidor). Cierra la terminal
+sobrante.
+
+Por si acaso, hay un comando de rescate que corta la grabacion en curso y
+deja el microfono libre:
+
+```
+/voice-cancel
+```
+
+Y para que no vuelva a pasar, el estado de "estoy grabando" **no vive en el
+terminal**: se le pregunta al servidor (RPC `voice` -> `status().recording`).
+Asi dos terminales abiertas a la vez se dan cuenta de que hay una grabacion
+en curso en lugar de pelearse por ella. Ademas, si la grabacion la started esta
+terminal y el plugin se descarga, se para el microfono antes de irse.
+
 #### Una sola interfaz de voz
 
 Hay dos plugins de voz: `@juliuskb/opencode-voice` (el motor de Whisper) y

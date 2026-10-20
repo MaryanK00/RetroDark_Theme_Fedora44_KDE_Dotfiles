@@ -553,6 +553,39 @@ export const OpencodeVoiceTTS = {
         },
       })
 
+      // Rescate: corta la grabacion en curso del motor de Whisper y deja el
+      // microfono libre. Util si el motor se queda creyendo que sigue
+      // grabando (por ejemplo, si se cierra el terminal con la grabacion
+      // abierta).
+      editor.add({
+        name: "voice-cancel",
+        description: "Corta la grabacion en curso y libera el microfono (rescate)",
+        execute: async (input) => {
+          const VoiceRpc = {
+            id: "voice",
+            methods: {
+              recordCancel: { input: { type: "object", additionalProperties: false } },
+              status: { input: { type: "object", additionalProperties: false } },
+            },
+            events: {},
+          }
+          try {
+            const st = await ctx.rpc(VoiceRpc).status({})
+            if (!st?.recording) {
+              trace("voice-cancel: no habia grabacion en curso")
+              await say(input.sessionID, "No hay ninguna grabacion en curso.")
+              return
+            }
+            await ctx.rpc(VoiceRpc).recordCancel({})
+            trace("voice-cancel: grabacion cancelada")
+            await say(input.sessionID, "Grabacion cancelada. Microfono libre.")
+          } catch (err) {
+            trace("voice-cancel fallo:", err?.message ?? String(err))
+            await say(input.sessionID, "No se pudo cancelar la grabacion.")
+          }
+        },
+      })
+
       // Diagnostico: comprueba el microfono y el motor de dictado sin
       // necesidad de pulsar ninguna tecla. Con una ruta de audio transcribe
       // ese fichero; sin ella, graba 3 segundos del microfono.

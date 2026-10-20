@@ -233,6 +233,9 @@ async function setupInner(context) {
   trace("setup: pid", process.pid, "cliente", CLIENT_ID)
 
   let recording = false
+  // Si esta instancia fue la que empezo a grabar, es responsable de pararla
+  // al descargarse el plugin: si no, el microfono se queda abierto.
+  let startedByUs = false
   let busy = false
   let lastSessionID = null
   // true mientras el borrador esta en el dialogo de revision
@@ -550,8 +553,23 @@ async function setupInner(context) {
       const route = context.ui.router.current()
       if (route?.type === "session") lastSessionID = route.sessionID
 
+      // La verdad la tiene el servidor: si ya hay grabacion (la haya abierto
+      // otra terminal) la paramos; si no, grabamos. Asi dos terminales
+      // abiertas a la vez no se pisan ni desincronizan.
+      const st = await withTimeout(voiceRpc().status({}), 8000, "status")
+      recording = !!st?.recording
+
       if (!recording) {
-        await withTimeout(voiceRpc().recordStart({}), 10000, "recordStart")
+        try {
+          await withTimeout(voiceRpc().recordStart({}), 10000, "recordStart")
+          startedByUs = true
+        } catch (err) {
+          // Puede que otra terminal lo haya empezado entre medias: eso no es
+          // un fallo, es el estado real.
+          if (!/already recording|already running/i.test(errText(err))) throw err
+          startedByUs = false
+          trace("la grabacion ya estaba en marcha")
+        }
         recording = true
         trace("grabando")
         toast("Grabando... vuelve a pulsar para parar", "info")
@@ -559,6 +577,7 @@ async function setupInner(context) {
       }
 
       recording = false
+      startedByUs = false
       const stopped = await withTimeout(voiceRpc().recordStop({}), 20000, "recordStop")
       localPhase = "transcribing"
       const wav = stopped?.wav
@@ -571,7 +590,6 @@ async function setupInner(context) {
       toast("Transcribiendo...", "info")
       await withTimeout(voiceRpc().transcribe({ wav, client: CLIENT_ID }), 20000, "transcribe")
     } catch (err) {
-      recording = false
       localPhase = "idle"
       trace("dictado fallo:", errText(err))
       toast("Dictado: " + errText(err), "error")
@@ -824,6 +842,22 @@ async function setupInner(context) {
     try {
       offDirect?.()
     } catch {}
+    // Si grabamos nosotros y nos descargamos, el microfono se queda abierto
+    // para siempre en el servidor: lo paramos aqui.
+    if (startedByUs) {
+      startedByUs = false
+      void (async () => {
+        try {
+          const st = await voiceRpc().status({})
+          if (st?.recording) {
+            await voiceRpc().recordStop({})
+            trace("microfono cerrado al descargar el plugin")
+          }
+        } catch (err) {
+          trace("no se pudo cerrar el microfono:", errText(err))
+        }
+      })()
+    }
     try {
       if (pollTimer) clearInterval(pollTimer)
       pollTimer = null

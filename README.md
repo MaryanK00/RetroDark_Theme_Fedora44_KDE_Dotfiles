@@ -199,7 +199,8 @@ Lo esencial:
   `ctrl+alt+m` para silenciar la lectura y `ctrl+alt+t` para cambiar de
   timbre. Comandos: `/speak` (silencia o activa), `/voice` (cambia el preset:
   `k2`, `e4`, `j1`, `plain`), `/voice-test`, `/voice-capture-test` (prueba
-  del micro y de Whisper) y `/voice-reset` (libera un dictado atascado). El
+  del micro y de Whisper), `/voice-reset` (libera un dictado atascado) y
+  `/voice-cancel` (corta una grabacion que se haya quedado colgada). El
   binario y los modelos no se versionan: `./scripts/install-voice.sh` los
   deja listos.
 
