@@ -252,7 +252,6 @@ async function setupInner(context) {
   // al descargarse el plugin: si no, el microfono se queda abierto.
   let startedByUs = false
   let busy = false
-  let lastSessionID = null
   // true mientras el borrador esta en el dialogo de revision
   let draftOpen = false
 
@@ -447,53 +446,116 @@ async function setupInner(context) {
   /**
    * Sesion a la que se envia el dictado.
    *
-   * Tras un /new el TUI puede quedarse sin ruta de sesion, y si se usa la
-   * ultima sesion conocida el texto se va a la conversacion ANTERIOR. Por eso
-   * se consulta, en este orden:
-   *   1. la pestana activa,
-   *   2. la ruta actual,
-   *   3. la sesion mas reciente,
-   *   4. y solo como ultimo recurso, la ultima conocida.
+   * La UNICA fuente de verdad es la ruta del TUI, o sea lo que hay en
+   * pantalla. En OpenCode 2.1.1 el comando /new NO crea sesion: navega a la
+   * pantalla de inicio ({type:"home"}) y deja la pestana activa apuntando a
+   * la conversacion ANTERIOR. Por eso aqui no se "adivina" nada: cualquier
+   * fallback (pestana activa, sesion mas reciente, ultima conocida) acaba
+   * mandando el texto a la conversacion anterior, que es justo lo que
+   * fallaba.
+   *
+   * Si no hay ruta de sesion, no hay destino: el envio abre una conversacion
+   * nueva (ver crearSesionDestino).
    */
   const sesionDeDestino = () => {
     try {
-      const pestanas = context.ui.tabs?.enabled?.() ? context.ui.tabs.list() : []
-      const activa = pestanas.find((t) => t?.active)
-      if (activa?.sessionID) {
-        trace("sesion de destino: pestana activa ->", activa.sessionID)
-        return activa.sessionID
-      }
-    } catch (err) {
-      trace("no se pudieron leer las pestanas:", errText(err))
-    }
-    try {
       const route = context.ui.router.current()
       if (route?.type === "session" && route.sessionID) {
-        trace("sesion de destino: ruta actual ->", route.sessionID)
+        trace("sesion de destino: la de la ruta ->", route.sessionID)
         return route.sessionID
       }
+      trace("sesion de destino: no hay conversacion abierta (ruta:", route?.type ?? "?", ")")
+      return null
     } catch (err) {
       trace("no se pudo leer la ruta:", errText(err))
+      return null
+    }
+  }
+
+  /**
+   * Crea una conversacion nueva y devuelve su id.
+   *
+   * Es lo que hace el TUI cuando escribes un mensaje a mano en la pantalla de
+   * inicio: crea la sesion y luego navega a ella. Aqui se replica, dejando
+   * que el SERVIDOR genere el id ("ses_" + 12 hex). El id NO se inventa ni se
+   * pasa: el schema del cliente es `id?: Session.ID | undefined`, asi que la
+   * clave "id" se omite del todo. Pasarla como null reventaba con
+   *   "Expected Session.ID | null at [\"id\"]"
+   */
+  const crearSesionDestino = async () => {
+    const loc = context.data?.location?.default?.()
+    const location = loc?.directory ? { directory: loc.directory } : undefined
+    const actual = context.ui?.model?.current?.()
+    const model =
+      actual?.providerID && actual?.modelID
+        ? {
+            providerID: actual.providerID,
+            id: actual.modelID,
+            ...(actual.variant ? { variant: actual.variant } : {}),
+          }
+        : undefined
+    let creada = null
+    try {
+      creada = await withTimeout(
+        context.client.session.create({
+          ...(location ? { location } : {}),
+          ...(model ? { model } : {}),
+        }),
+        15000,
+        "session.create",
+      )
+    } catch (err) {
+      // Si el modelo o la location molestan, se reintenta con lo minimo.
+      trace("session.create fallo, se reintenta sin modelo:", errText(err))
+      creada = await withTimeout(
+        context.client.session.create(location ? { location } : {}),
+        15000,
+        "session.create",
+      )
+    }
+    const id = creada?.id
+    if (!id) throw new Error("el servidor no devolvio el id de la sesion")
+    trace("sesion creada ->", id)
+    return id
+  }
+
+  /** Enseña al TUI la sesion nueva y navega hasta ella. */
+  const abrirSesion = async (sessionID) => {
+    try {
+      await context.data?.session?.sync?.(sessionID)
+    } catch (err) {
+      trace("no se pudo sincronizar la sesion nueva:", errText(err))
     }
     try {
-      const sesiones = context.data.session.list() ?? []
-      const recientes = [...sesiones].sort(
-        (a, b) => (b?.time?.updated ?? 0) - (a?.time?.updated ?? 0),
-      )
-      const id = recientes[0]?.id ?? recientes[0]?.sessionID
-      if (id) {
-        trace("sesion de destino: la mas reciente ->", id)
-        return id
-      }
+      context.ui.router.navigate({ type: "session", sessionID })
+      trace("navegado a la sesion:", sessionID)
     } catch (err) {
-      trace("no se pudo leer la lista de sesiones:", errText(err))
+      trace("no se pudo navegar a la sesion:", errText(err))
     }
-    if (lastSessionID) {
-      trace("sesion de destino: la ultima conocida ->", lastSessionID)
-      return lastSessionID
+  }
+
+  /**
+   * Envia el texto a una sesion.
+   *
+   * Si la sesion ya no existe (se borro entre medias, o el TUI se queda con
+   * una ruta vieja) se crea una nueva y se reintenta una vez, para que el
+   * texto no se pierda.
+   */
+  const enviarDictado = async (sessionID, text) => {
+    try {
+      await withTimeout(context.client.session.prompt({ sessionID, text }), 30000, "session.prompt")
+      trace("dictado enviado:", text.length, "caracteres")
+      return true
+    } catch (err) {
+      const msg = errText(err)
+      if (!/not found|404|no existe|does not exist/i.test(msg)) throw err
+      trace("la sesion ya no existe, se abre otra:", sessionID, "|", msg)
+      const nueva = await crearSesionDestino()
+      await abrirSesion(nueva)
+      await withTimeout(context.client.session.prompt({ sessionID: nueva, text }), 30000, "session.prompt")
+      trace("dictado enviado en la sesion nueva:", nueva)
+      return true
     }
-    trace("sesion de destino: ninguna")
-    return null
   }
 
   const voiceRpc = () => context.client.rpc(VoiceRpc)
@@ -613,16 +675,18 @@ async function setupInner(context) {
       if (!final) discarded = true
 
       if (!discarded) {
-        const sessionID = sesionDeDestino()
-        if (!sessionID) {
-          toast("No hay una conversacion a la que enviarlo", "error")
-        } else {
-          try {
-            await withTimeout(context.client.session.prompt({ sessionID, text: final }), 30000, "session.prompt")
-            trace("dictado enviado:", final.length, "caracteres")
-          } catch (err) {
-            toast("No se pudo enviar: " + errText(err), "error")
+        try {
+          let sessionID = sesionDeDestino()
+          if (!sessionID) {
+            // No hay ninguna conversacion abierta (pantalla de inicio o /new):
+            // se abre una nueva y se navega a ella, como hace el TUI cuando
+            // escribes un mensaje a mano desde el inicio.
+            sessionID = await crearSesionDestino()
+            await abrirSesion(sessionID)
           }
+          await enviarDictado(sessionID, final)
+        } catch (err) {
+          toast("No se pudo enviar: " + errText(err), "error")
         }
       } else {
         toast("Dictado descartado", "info")
@@ -656,8 +720,9 @@ async function setupInner(context) {
     }
     busy = true
     try {
-      const destino = sesionDeDestino()
-      if (destino) lastSessionID = destino
+      // Se anota el destino solo para la traza: no se cachea, porque al
+      // enviar el usuario puede haber cambiado de conversacion.
+      trace("dictado en la sesion:", sesionDeDestino() ?? "(ninguna)")
 
       // La verdad la tiene el servidor: si ya hay grabacion (la haya abierto
       // otra terminal) la paramos; si no, grabamos. Asi dos terminales

@@ -45,6 +45,26 @@ const slots = []
 const layers = []
 const rpcCalls = []
 const teclas = []
+// Manejadores de los eventos RPC: el plugin se suscribe a "result",
+// que es como le llega la transcripcion.
+const rpcHandlers = new Map()
+// Llamadas al cliente HTTP de sesiones: "create" (abrir conversacion) y
+// "prompt" (mandar el texto). Se guardan para comprobar a donde va el
+// dictado y con que payload.
+const createCalls = []
+const promptCalls = []
+const navegaciones = []
+// La ruta que ve el TUI. Cambia entre escenarios (con conversacion abierta /
+// en la pantalla de inicio).
+let mockRoute = { type: "session", sessionID: "ses_actual" }
+
+/** Lee el log de la traza del plugin. */
+async function leerTraza() {
+  return (await import("node:fs/promises")).readFile(
+    join(fakeHome, ".local/share/opencode/voice-tui.log"),
+    "utf8",
+  )
+}
 
 function fakeRpc(definition) {
   const methods = {
@@ -57,7 +77,12 @@ function fakeRpc(definition) {
     recordCancel: async () => {},
   }
   const proxy = {
-    events: { on: () => () => {} },
+    events: {
+      on: (evento, manejador) => {
+        rpcHandlers.set(evento, manejador)
+        return () => {}
+      },
+    },
     on: () => () => {},
   }
   for (const name of Object.keys(definition.methods ?? {})) {
@@ -72,7 +97,18 @@ function fakeRpc(definition) {
 const mock = {
   client: {
     rpc: fakeRpc,
-    session: { prompt: async () => {} },
+    session: {
+      // Abrir una conversacion nueva: el servidor genera el id.
+      create: async (input) => {
+        createCalls.push(input)
+        return { id: "ses_nueva" }
+      },
+      // Mandar el texto a una conversacion.
+      prompt: async (input) => {
+        promptCalls.push(input)
+        return {}
+      },
+    },
   },
   keymap: {
     layer: (factory) => {
@@ -105,15 +141,27 @@ const mock = {
       }
     },
     toast: { show: () => {} },
-    dialog: { prompt: async () => undefined },
-    router: { current: () => ({ type: "home" }), register: () => () => {} },
+    // El dialogo devuelve el texto tal cual: como si el usuario pulsase
+    // Enter sin tocarlo.
+    dialog: { prompt: async (opts) => opts?.value },
+    router: {
+      current: () => mockRoute,
+      navigate: (destino) => {
+        navegaciones.push(destino)
+      },
+      register: () => () => {},
+    },
     tabs: {
+      // Las pestanas siguen apuntando a la conversacion ANTERIOR: tras un
+      // /new el TUI no abre pestana nueva, asi que la activa es la vieja.
+      // El plugin NO debe usarlas como destino.
       enabled: () => true,
       list: () => [
         { sessionID: "ses_activa", active: true },
         { sessionID: "ses_otra", active: false },
       ],
     },
+    model: { current: () => undefined },
   },
   data: {
     session: {
@@ -121,7 +169,10 @@ const mock = {
         { id: "ses_reciente", time: { updated: 2000 } },
         { id: "ses_antigua", time: { updated: 1000 } },
       ],
+      get: () => undefined,
+      sync: async () => {},
     },
+    location: { default: () => ({ directory: "/tmp/opencode/prueba" }) },
   },
 }
 
@@ -214,27 +265,82 @@ check(
   panelRoto?.desregistrado ? "desregistrado" : "sigue registrado",
 )
 
-// 3c. el dictado tiene que ir a la sesion que esta activa.
-// Antes el destino era "la ultima sesion conocida", que tras un /new es la
-// conversacion ANTERIOR: el texto se iba a la ventana equivocada.
+// 3c. el dictado tiene que ir a la conversacion que esta en pantalla.
+// Antes el destino era "la ultima sesion conocida" (o la pestana activa, o la
+// sesion mas reciente): tras un /new todo eso es la conversacion ANTERIOR y
+// el texto se iba a la ventana equivocada. Ahora el destino es la RUTA.
 const atajo = teclas[0]
 if (atajo) {
   atajo({ name: "space", ctrl: true, meta: false, shift: false })
   await new Promise((r) => setTimeout(r, 300))
 }
-const trazaDestino = await (await import("node:fs/promises")).readFile(
-  join(fakeHome, ".local/share/opencode/voice-tui.log"),
-  "utf8",
+const trazaDestino = await leerTraza()
+const lineasDestino = trazaDestino.split("\n").filter((l) => l.includes("destino")).join(" | ")
+check(
+  "el dictado va a la sesion de la ruta",
+  /sesion de destino: la de la ruta -> ses_actual/.test(trazaDestino),
+  lineasDestino,
 )
 check(
-  "el dictado va a la pestana activa",
-  /sesion de destino: pestana activa -> ses_activa/.test(trazaDestino),
-  trazaDestino.split("\n").filter((l) => l.includes("destino")).join(" | "),
+  "el dictado no cae en la pestana activa",
+  !/sesion de destino: pestana activa/.test(trazaDestino),
+  lineasDestino,
+)
+check(
+  "el dictado no cae en la sesion mas reciente",
+  !/sesion de destino: la mas reciente/.test(trazaDestino),
+  lineasDestino,
 )
 check(
   "el dictado no cae en la ultima sesion conocida",
   !/sesion de destino: la ultima conocida/.test(trazaDestino),
-  trazaDestino.split("\n").filter((l) => l.includes("destino")).join(" | "),
+  lineasDestino,
+)
+
+// 3d. el texto se manda a la conversacion de la ruta.
+const resultado = rpcHandlers.get("result")
+if (resultado) {
+  await resultado({ data: { text: "hola desde el dictado", take: "take-1" } })
+}
+check(
+  "el texto se envia a la sesion de la ruta",
+  promptCalls.length === 1 && promptCalls[0]?.sessionID === "ses_actual",
+  JSON.stringify(promptCalls),
+)
+check(
+  "no se abre ninguna conversacion nueva si ya hay una",
+  createCalls.length === 0,
+  JSON.stringify(createCalls),
+)
+
+// 3e. sin conversacion abierta (pantalla de inicio o /new) se abre una nueva.
+// El /new de OpenCode 2.1.1 NO crea sesion: deja el TUI en la pantalla de
+// inicio, y ahi el dictado tiene que abrir su propia conversacion.
+mockRoute = { type: "home" }
+await mod.default.setup(mock)
+const resultadoInicio = rpcHandlers.get("result")
+if (resultadoInicio) {
+  await resultadoInicio({ data: { text: "hola desde el inicio", take: "take-2" } })
+}
+check(
+  "sin conversacion abierta se abre una",
+  createCalls.length === 1,
+  JSON.stringify(createCalls),
+)
+check(
+  "la conversacion nueva se crea SIN id (lo genera el servidor)",
+  createCalls.length === 1 && createCalls[0] != null && !("id" in createCalls[0]),
+  JSON.stringify(createCalls),
+)
+check(
+  "el texto va a la conversacion nueva",
+  promptCalls.length === 2 && promptCalls[1]?.sessionID === "ses_nueva",
+  JSON.stringify(promptCalls),
+)
+check(
+  "el TUI navega a la conversacion nueva",
+  navegaciones.some((n) => n?.type === "session" && n?.sessionID === "ses_nueva"),
+  JSON.stringify(navegaciones),
 )
 
 // 4. los atajos se leen del fichero
