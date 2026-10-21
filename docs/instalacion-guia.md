@@ -527,6 +527,33 @@ plugin de Whisper lo ejecuta bajo un watchdog que lo mata si OpenCode muere, y
 barre grabadores huerfanos al arrancar. Al terminar, se abre un **borrador
 editable** con lo que dijo el micro: `Enter` lo envia, `Esc` lo descarta.
 
+#### Donde aterriza el texto dictado
+
+El dictado va a la **conversacion de la pantalla que estas mirando**. Si la
+pantalla actual ya tiene una conversacion, se entrega ahi; si esta en la
+portada (por ejemplo despues de `/new`, que no crea conversacion hasta que
+se envia algo), el plugin **crea una conversacion nueva**, se navega a ella y
+entrega el texto ahi. Asi el texto nunca se va a una conversion vieja.
+
+#### El modo con el que sale el dictado
+
+El texto entra con el **modo que tengas elegido** (plan o build). Si estas en
+modo plan, el texto se entrega como plan y el agente responde con el plan en
+lugar de tocar ficheros. Si estas en build, se comporta como siempre.
+
+#### Que microfono se usa
+
+Por defecto el del sistema. Para usar uno concreto (por ejemplo el de un
+auricular USB que siempre este conectado) se pone en
+`~/.local/share/opencode-voice/settings.json`:
+
+```json
+{ "device": "alsa_input.usb-EPOS_S6_A004780224000943-03.analog-stereo" }
+```
+
+El plugin lo pasa a `pw-record --target`, asi que el nombre tiene que ser
+exactamente el de la fuente (`pactl list short sources`).
+
 #### Si el dictado se duplica o el microfono se queda abierto
 
 Si al pulsar `ctrl+space` pasa cualquier cosa raro (dos dictados a la vez,
@@ -578,30 +605,16 @@ scripts/patch-voice-plugin.sh
 OpenCode reinstala los plugins con un hash nuevo cada cierto tiempo y suelta
 el parche, por eso se reaplica solo en cada arranque.
 
-#### El panel lateral de voz
+#### El estado se avisa con un aviso
 
-En la barra lateral (a la derecha) aparece nuestro propio panel:
+No hay panel lateral. Se intento —y se abandono— porque el TUI y el plugin
+viven en procesos distintos y no comparten el runtime de Solid: el panel
+reventaba al dibujarse ("No renderer found") y OpenCode repetia el error sin
+parar.
 
-```
-voz: k2
-```
-
-y mientras se graba, en su lugar:
-
-```
-grabando 3s ▁▂▃▅▇▅▃▂▁
-```
-
-El medidor se alimenta del RPC `level` del plugin de Whisper (nivel RMS de los
-ultimos ~100 ms de audio). Se consulta cada 200 ms mientras hay grabacion y
-cada 1 s en reposo, asi que **tambien se enciende si grabas con el atajo del
-otro plugin**, no solo con el nuestro.
-
-El panel es un slot en `sidebar.content` que devuelve **texto plano**: un
-`JSX.Element` de Solid admite un `string`, asi que no hace falta importar el
-runtime de Solid (que un plugin local no puede resolver). Como no hay
-reactividad sin Solid, cuando el texto cambia se **vuelve a registrar** el slot
-(`context.ui.slot` devuelve la funcion para desregistrar).
+El estado se comunica con **avisos (toast)**: al empezar a grabar, al parar,
+al transcribir, al silenciar la voz y al cambiar de timbre. Es lo unico que
+funciona sin depender de la terminal.
 
 #### La custodia del audio (y por que se trababa el dictado)
 
@@ -682,31 +695,6 @@ watcher**, con lo que la mitad de terminal dejaba de recargarse sola. Ahora
 `install.sh` comprueba el enlace antes de tocarlo, asi que instalarlo ya no
 rompe nada.
 
-#### El runtime de Solid: por que el panel necesita un enlace
-
-El panel lateral se dibuja con el runtime de Solid (`@opentui/solid`), igual
-que hace el plugin de Whisper. Y para que funcione tiene que ser **la misma
-instancia** que usa el TUI: si el plugin importa otra copia, su contexto de
-Solid es otro distinto y el `<text>` revienta al dibujarse.
-
-De ahi `scripts/link-voice-solid.sh`, que enlaza al `node_modules` del plugin
-local (`files/config/opencode/plugins/opencode-voice-tts/node_modules/`, que
-**no se versiona**) la copia de `@opentui/solid`, `@opentui/core` y `solid-js`
-que tiene el plugin de Whisper en la cache de npm de OpenCode. Con ese
-enlace, el especificador `"@opentui/solid"` resuelve a la misma ruta y Bun
-reutiliza la instancia ya cargada.
-
-`install-voice.sh` lo llama en cada instalacion, porque OpenCode reinstala los
-plugins con un hash nuevo y suelta el enlace.
-
-#### El panel lateral no puede fallar en bucle
-
-El `render` del slot va envuelto en un `try/catch`: si revienta, se avisa por
-la traza y, a la tercera vez, **el slot se desregistra**. Sin ese guardia
-OpenCode repite el error sin parar ("opencode-voice-tts/tui crashed in slot
-sidebar"). La puerta lo comprueba: `scripts/test-voice-tui.mjs` incluye una
-comprobacion con el runtime de Solid roto a proposito.
-
 #### Limitacion: `context.storage` en la mitad TUI
 
 El namespace de storage se deriva del ID del plugin, y el de la mitad TUI de
@@ -721,14 +709,15 @@ un ID de plugin valido.
 
 Por la misma razon **no hay indicador en la barra inferior** (el pie de la
 terminal): ahi el texto plano descuadraba el ancho de la barra. El estado se ve
-en los avisos (toast) que salen al pulsar los atajos y en el **panel lateral**
-(ver "El panel lateral de voz").
+en los avisos (toast) que salen al pulsar los atajos (ver "El estado se avisa
+con un aviso").
 
 #### La puerta: el test de humo
 
 `scripts/test-voice-tui.mjs` monta un contexto falso de OpenTUI y comprueba
-que la mitad TUI arranca, que registra la capa de teclado y el panel, y que
-el texto del panel es el correcto. Antes de tocar nada:
+que la mitad TUI arranca, que registra la capa de teclado y la paleta, y que
+el dictado va a la sesion de la pestana activa (y no a una cacheada). Antes
+de tocar nada:
 
 ```bash
 node --check files/config/opencode/plugins/opencode-voice-tts/tui.js
