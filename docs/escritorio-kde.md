@@ -202,7 +202,7 @@ como `link`.
 Tres ficheros:
 
 - `1.orp`: el perfil con el estado de cada dispositivo (efectos, colores,
-  dispositivos queiganan el control)
+  dispositivos que ganan el control)
 - `OpenRGB.json`: la lista de dispositivos que esta versión de OpenRGB
   reconoce
 - `sizes.ors`: los tamaños de las tiras de LED
@@ -214,8 +214,23 @@ Un `.orp` guarda, para cada dispositivo, la ruta HID con la que se encontró
 teclado, un ratón o un receptor USB: el mismo ratón puede pasar de
 `/dev/hidraw2` a `/dev/hidraw4` según el orden de enumeración del kernel.
 
+No todos los dispositivos se comportan igual:
+
+- **ASUS Aura y Keychron** se guardan como `HID: /dev/hidrawN`. OpenRGB los
+  empareja por **GUID**, así que OpenRGB los reasigna solos en cada arranque:
+  el perfil no se rompe aunque el número cambie.
+- **Ratón y receptor EVGA** se guardan como `/dev/hidrawN` a secas. OpenRGB los
+  empareja por **ruta exacta**, así que en cuanto el ratón se duerme y se
+  reconecta sus números se desplazan y su perfil deja de cargar. En el log
+  sale `Profile loading: FAILED! for EVGA ...`.
+
 Si el perfil queda desfasado, OpenRGB aplica el efecto al dispositivo
-equivocado —o no lo aplica—.
+equivocado —o no lo aplica—. El log del arranque dice exactamente qué pasó
+con cada dispositivo:
+
+```bash
+grep "Profile loading" ~/.config/OpenRGB/logs/$(ls -t ~/.config/OpenRGB/logs/ | head -1)
+```
 
 Comprobar el perfil guardado:
 
@@ -231,28 +246,41 @@ openrgb --list-devices
 
 Si no coinciden, hay que re-guardar el perfil.
 
-### Re-guardar el perfil
+### Re-guardar el perfil (⚠️ solo desde la GUI)
 
-Cerrar la instancia que esté corriendo —la GUI de la bandeja es la misma— y
-ejecutar:
+> **Nunca guardes el perfil con `openrgb -sp`.** Esa orden arranca una
+> instancia **sin interfaz y sin cargar ningún perfil**, así que todos los LED
+> se guardan en **negro (`0x00`)** en lugar de su color real. El fallo es
+> silencioso: OpenRGB responde `Profile saved successfully` y el fichero sale
+> perfectamente válido, pero la placa se queda apagada. Por eso el perfil de
+> este repo se versiona a mano y se revisa con `hexdump` (abajo).
+
+La forma correcta es desde la GUI:
+
+1. Abrir OpenRGB (icono en la bandeja) y **comprobar que las luces están
+   encendidas**.
+2. *Devices* → botón **Save profile** → guardar con el nombre `1`.
+3. Comprobar que el fichero se actualizó:
 
 ```bash
-openrgb -sp /tmp/1-nuevo
+ls -l --time-style=full-iso ~/.config/OpenRGB/1.orp
 ```
 
-> **Ojo**: `-sp` **añade** la extensión `.orp`, así que el fichero acaba en
-> `/tmp/1-nuevo.orp`, no en `/tmp/1-nuevo`.
-
-Validarlo antes de copiarlo:
+Antes de darlo por bueno, comprobar que los colores **no** están en negro.
+El array de color por LED de la ASUS Aura (94 LED) está en el offset 3935 del
+perfil actual:
 
 ```bash
-strings /tmp/1-nuevo.orp | grep -E "hidraw"
+hexdump -C -s 3935 -n 16 ~/.config/OpenRGB/1.orp
 ```
 
-Y después:
+Salida correcta: `5e 00` (nº de LED) seguido de `ff ff ff 00` repetido.
+Si sale `00 00 00 00`, el perfil está apagado y hay que rehacerlo.
+
+Después, al repo y a reiniciar:
 
 ```bash
-cp /tmp/1-nuevo.orp ~/dotfiles/files/config/OpenRGB/1.orp
+cp ~/.config/OpenRGB/1.orp ~/dotfiles/files/config/OpenRGB/1.orp
 systemctl --user restart 'app-OpenRGB@autostart.service'
 ```
 
