@@ -30,13 +30,19 @@ relevante son las opciones activas:
 ```
 include current-theme.conf
 kitty_mod ctrl+shift
-enabled_keyboard_protocols kitty,legacy
 font_family Cascadia Code NF
 font_size 12
 background_opacity 0.4
 background_blur 3
 window_padding_width 10
 ```
+
+> La opción `enabled_keyboard_protocols` se puso aquí en su día para
+> arreglar un problema con tmux, pero **no existe en kitty** (en ninguna
+> versión): kitty avisaba en cada recarga con `Ignoring unknown config
+> key`. El protocolo de teclado de kitty se negocia solo con cada
+> aplicación, y tmux 3.4 o posterior lo entiende sin configuración
+> extra, así que la opción se eliminó.
 
 ### El tema Hachiko
 
