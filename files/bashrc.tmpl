@@ -24,15 +24,27 @@ if [ -d ~/.bashrc.d ]; then
 fi
 unset rc
 
-fastfetch
-export PATH="$HOME/.cargo/bin:$PATH"
+# fastfetch (solo si esta instalado)
+if command -v fastfetch >/dev/null 2>&1; then
+    fastfetch
+fi
 
-#JAVA_HOME
-export JAVA_HOME=$(dirname $(dirname $(readlink -f $(which java))))
-export PATH=$JAVA_HOME/bin:$PATH
+# cargo (solo si el usuario lo tiene instalado en ~/.cargo/bin)
+if [ -d "$HOME/.cargo/bin" ]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+fi
 
-# opencode
-export PATH=__HOME__/.opencode/bin:$PATH
+#JAVA_HOME (solo si hay java instalado)
+if command -v java >/dev/null 2>&1; then
+    JAVA_HOME=$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")
+    export JAVA_HOME
+    export PATH="$JAVA_HOME/bin:$PATH"
+fi
+
+# opencode (solo si el directorio existe)
+if [ -d "__HOME__/.opencode/bin" ]; then
+    export PATH="__HOME__/.opencode/bin:$PATH"
+fi
 
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm

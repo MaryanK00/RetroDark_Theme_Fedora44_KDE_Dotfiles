@@ -50,7 +50,7 @@ Las rutas absolutas se resuelven solas.
 | `~/.gitconfig` | git con LFS y el helper de credenciales de `gh` |
 | `~/.tmux.conf` | tmux |
 | `~/.gtkrc-2.0` | GTK 2 |
-| `~/.config/kitty/` | terminal: tema *Hachiko*, opacidad 0.4, blur 3, FiraCode Nerd Font |
+| `~/.config/kitty/` | terminal: tema *Hachiko*, opacidad 0.4, blur 3, Cascadia Code NF |
 | `~/.config/kdedefaults/` | configuración de Plasma (kwinrc, plasmarc, kdeglobals…) |
 | `~/.config/plasma-org.kde.plasma.desktop-appletsrc` | paneles, widgets, fondos de pantalla y konsole |
 | `~/.config/opencode/` | tema `retro-dark`, sonidos, `cli.json`, `opencode.json`, `AGENTS.md`, el arranque del MCP de GitHub y el plugin de voz |
@@ -60,6 +60,10 @@ Las rutas absolutas se resuelven solas.
 | `~/.config/kate/` | editor Kate |
 | `~/.config/gtk-3.0/` | tema GTK 3 |
 | `~/.config/ardour9/` | configuración de Ardour |
+
+El detalle de cada pieza —el tema *Hachiko* y la fuente del terminal, la
+capa `kdedefaults` de Plasma, el perfil de OpenRGB— está en
+[`docs/escritorio-kde.md`](docs/escritorio-kde.md).
 
 ## Qué no se incluye
 
@@ -74,6 +78,11 @@ fuera de forma deliberada:
   y datos de Flatpak
 - las rutas absolutas del home: en las plantillas se emplea el marcador
   `__HOME__`
+- los ficheros de configuración que Plasma guarda por usuario
+  (`~/.config/kdeglobals`, `~/.config/kwinrc`, `~/.config/plasmarc`,
+  `~/.config/ksplashrc`, `~/.config/kcminputrc`) y los de autostart
+  (`~/.config/autostart/`): el repositorio solo gestiona la capa
+  `~/.config/kdedefaults/`
 
 El repositorio pesa **~400 KB**. El material de mayor tamaño (1,4 MB de
 sonidos) tampoco se distribuye, por el motivo que se explica en
@@ -277,7 +286,8 @@ bash scripts/scan-secrets.sh .
 │   ├── make-sounds.sh      genera los WAV desde el tema de Nier
 │   └── scan-secrets.sh     escáner de credenciales propio
 ├── docs/
-│   └── instalacion-guia.md guía de la parte de OpenCode que no es estética
+│   ├── instalacion-guia.md guía de la parte de OpenCode que no es estética
+│   └── escritorio-kde.md  guía del escritorio: Plasma, Kitty, Cava, tmux
 ├── hooks/pre-commit        gitleaks + límites de tamaño
 └── rendered/               copias renderizadas (no se versionan)
 ```

@@ -19,6 +19,9 @@ Un fichero queda **fuera** del repositorio a proposito:
 claves, y por eso `install.sh` no lo gestiona: no se sobrescribe ni se
 versiona nunca.
 
+Para la parte que no es de OpenCode —Plasma, Kitty, Cava, tmux, Kate,
+GTK 3, OpenRGB y Ardour— ver [`escritorio-kde.md`](escritorio-kde.md).
+
 ---
 
 ## `opencode.json`: el fichero de comportamiento
