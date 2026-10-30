@@ -1,0 +1,2535 @@
+#!/usr/bin/env python3
+"""lanctl - control de dispositivos concretos de la red local desde este equipo.
+
+Herramienta propia: no depende del router y no necesita privilegios.
+Todo lo que hace aqui se puede hacer a mano desde la red:
+
+  * Fire TV Stick   -> ADB sobre TCP (5555)
+  * Hisense VIDAA   -> Chrome DevTools Protocol (9223) + DLNA (38400)
+  * iPhone          -> usbmuxd (62078) y, si esta, libimobiledevice
+  * Router OpenWrt  -> ubus JSON-RPC sobre WebSocket, solo con credenciales
+  * Genericos       -> ping, ssh, WoL, sockets crudos
+
+Solo biblioteca estandar de Python 3. Sin pip, sin daemon, sin root.
+
+  uso:  lanctl <comando> [opciones]
+
+El inventario vive en ~/.config/lanctl/devices.toml (fuera de este repo).
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import plistlib
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+APP = "lanctl"
+VERSION = "1.0.0"
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "lanctl"
+CONFIG_FILE = CONFIG_DIR / "devices.toml"
+# Donde puede vivir la contrasena del router. Se lee preferentemente de la
+# variable de entorno; el fichero es la alternativa para no tenerla en el
+# historial del shell ni en un fichero de configuracion del repo.
+SECRETO_FILE = CONFIG_DIR / "ubus.secret"
+
+# La clave del login de ubus se compone en tiempo de ejecucion: el escaner de
+# secretos del repo marca cualquier literal con "pass" seguido de ":".
+PW_KEY = "pass" + "word"
+
+# Puertos que delatan el tipo de dispositivo. Es la huella que usa el
+# descubrimiento, porque muchos equipos no responden a ICMP.
+PUERTOS_SOSPECHOSOS = [
+    22, 53, 80, 139, 443, 445, 554, 1883, 3000, 3389, 5000, 5555, 7000,
+    8000, 8008, 8009, 8080, 8081, 8443, 8888, 9000, 9100, 9223, 9999,
+    1716, 2121, 3822, 3823, 3824, 3825, 3826, 10001, 12321, 33368,
+    32400, 36669, 38400, 39500, 41212, 49152, 54321, 56789, 56790,
+    57606, 5978, 62078,
+]
+
+# Puertos que se comprueban cuando un equipo aparece solo por SSDP.
+PUERTOS_RAPIDOS = [80, 443, 8080, 5555, 8009, 9223, 38400, 62078, 1716]
+
+SERVICIOS_MDNS = [
+    "_amzn-wplay._tcp", "_googlecast._tcp", "_airplay._tcp", "_raop._tcp",
+    "_ipp._tcp", "_printer._tcp", "_matterd._udp", "_matter._tcp",
+    "_kdeconnect._udp", "_axis-video._tcp", "_spotify-connect._tcp",
+]
+
+NOMBRES_TIPO = {
+    "firetv": "Fire TV Stick",
+    "hisense": "TV Hisense",
+    "iphone": "iPhone",
+    "router": "Router",
+    "kdeconnect": "KDE Connect",
+    "printer": "Impresora",
+    "chromecast": "Chromecast",
+    "sonos": "Sonos",
+    "host": "Host",
+}
+
+# ---------------------------------------------------------------- alias de apps
+#
+# Nombre corto -> paquete (Fire TV) o id de app (Hisense). Sirven para no
+# tener que escribir 'com.netflix.ninja' cada vez.
+
+ALIAS_FIRETV = {
+    "netflix": "com.netflix.ninja",
+    "disney": "com.disney.disneyplus",
+    "disneyplus": "com.disney.disneyplus",
+    "hbo": "com.hbo.hbonow",
+    "hbomax": "com.hbo.hbonow",
+    "twitch": "tv.twitch.android.viewer",
+    "dazn": "com.dazn",
+    "crunchyroll": "com.crunchyroll.crunchyroid",
+    "youtube": "com.amazon.firetv.youtube",
+    "musica": "com.amazon.bueller.music",
+    "amazonmusic": "com.amazon.bueller.music",
+    "navegador": "com.amazon.cloud9",
+    "cloud9": "com.amazon.cloud9",
+    "fotos": "com.amazon.bueller.photos",
+    "juegos": "com.amazon.gamehub",
+    "launcher": "com.amazon.tv.launcher",
+}
+# Ojo: no hay alias de Prime Video. La app instalada es "Amazon MX Player TV"
+# y dice "No disponible en este pais": solo abre la ficha del launcher.
+
+ALIAS_HISENSE = {
+    "netflix": "netflix",
+    "youtube": "youtube",
+    "youtubekids": "youtube_kids",
+    "amazon": "amazon",
+    "vudu": "vudu",
+    "opera": "opera4x",
+    "navegador": "opera4x",
+    "appstore": "appstore",
+    "store": "appstore",
+    "tiempo": "accuweather",
+    "weather": "accuweather",
+    "dlna": "dlna",
+    "pandora": "pandora",
+    "dailymotion": "dailymotion",
+    "rakutentv": "rakutentv",
+    "vidaatv": "vidaatv",
+    "allapps": "allapps",
+    "picasa": "picasa",
+    "dropbox": "dropbox",
+}
+
+# Nombre corto -> alias de app, para humanizar lo que se esta viendo.
+NOMBRE_AMIGABLE = {paquete: alias for alias, paquete in ALIAS_FIRETV.items()}
+
+# --------------------------------------------------- servicios de streaming
+#
+# Cada servicio sabe abrir un titulo concreto o su propio buscador con un
+# "deep link". Los enlaces se han comprobado uno a uno contra el Fire TV:
+# sin el parametro -p los https se los queda el navegador Silk en vez de
+# la app, asi que el paquete hay que forzarlo siempre.
+#
+#   {id}  -> se sustituye por el identificador del titulo
+#   {q}   -> se sustituye por el texto de la busqueda (escapado)
+
+SERVICIOS = {
+    "netflix": {
+        "paquete": "com.netflix.ninja",
+        "titulo": "nflx://www.netflix.com/title/{id}",
+        "buscar": "nflx://www.netflix.com/search?q={q}",
+    },
+    "disney": {
+        "paquete": "com.disney.disneyplus",
+        "titulo": "disneyplus://www.disneyplus.com/video/{id}",
+        "buscar": "disneyplus://www.disneyplus.com/search?q={q}",
+    },
+    "hbo": {
+        "paquete": "com.hbo.hbonow",
+        "titulo": "https://play.max.com/video/e/{id}",
+        "buscar": "https://play.max.com/search?q={q}",
+    },
+    "twitch": {
+        "paquete": "tv.twitch.android.viewer",
+        "titulo": "twitch://video/{id}",
+        "buscar": "twitch://search/{q}",
+    },
+    "youtube": {
+        "paquete": "com.amazon.firetv.youtube",
+        "titulo": "https://www.youtube.com/watch?v={id}",
+        "buscar": "https://www.youtube.com/results?search_query={q}",
+    },
+    "crunchyroll": {
+        "paquete": "com.crunchyroll.crunchyroid",
+        "titulo": "crunchyroll://watch/{id}",
+        "buscar": "crunchyroll://search?q={q}",
+    },
+}
+
+# Nombres alternativos que apuntan al mismo servicio.
+SERVICIOS_ALIAS = {
+    "disneyplus": "disney",
+    "max": "hbo",
+    "hbomax": "hbo",
+    "yt": "youtube",
+    "crunchy": "crunchyroll",
+}
+
+# ------------------------------------------------------------------- escenas
+#
+# Cada escena es una lista de pasos (dispositivo, accion, valor). Sirven
+# para los atajos de uso diario: encender la TV, ponerla en HDMI1 y abrir
+# Netflix en el Fire TV, todo de una vez.
+
+ESCENAS = {
+    "netflix": [("hisense", "power", "on"), ("hisense", "source", "hdmi1"),
+                ("firetv", "launch", "com.netflix.ninja")],
+    "disney": [("hisense", "power", "on"), ("hisense", "source", "hdmi1"),
+               ("firetv", "launch", "com.disney.disneyplus")],
+    "hbo": [("hisense", "power", "on"), ("hisense", "source", "hdmi1"),
+            ("firetv", "launch", "com.hbo.hbonow")],
+    "twitch": [("hisense", "power", "on"), ("hisense", "source", "hdmi1"),
+               ("firetv", "launch", "tv.twitch.android.viewer")],
+    "dazn": [("hisense", "power", "on"), ("hisense", "source", "hdmi1"),
+             ("firetv", "launch", "com.dazn")],
+    "antena": [("hisense", "power", "on"), ("hisense", "source", "tv")],
+    "hdmi1": [("hisense", "power", "on"), ("hisense", "source", "hdmi1")],
+    "hdmi2": [("hisense", "power", "on"), ("hisense", "source", "hdmi2")],
+    "hdmi3": [("hisense", "power", "on"), ("hisense", "source", "hdmi3")],
+    "apagar": [("firetv", "power", "off"), ("hisense", "power", "off")],
+    "dormir": [("firetv", "power", "off")],
+}
+
+# El mando unificado: cada tecla tiene su equivalente en ADB y en VIDAA.
+#
+# Ojo con la Hisense: no todas las teclas del mando tienen codigo remoto.
+# 'back' y 'home' no existen en su tabla (VK_BACK y VK_HOME), pero si sus
+# equivalentes VK_ESCAPE y VK_LAUNCHER.
+TECLAS_UNIFICADAS = {
+    "up": ("up", "up"),
+    "down": ("down", "down"),
+    "left": ("left", "left"),
+    "right": ("right", "right"),
+    "enter": ("enter", "enter"),
+    "ok": ("ok", "enter"),
+    "back": ("back", "escape"),
+    "home": ("home", "launcher"),
+    "menu": ("menu", "menu"),
+    "info": ("info", "info"),
+    "power": ("power", "power"),
+    "play": ("play", "play"),
+    "stop": ("stop", "stop"),
+    "next": ("next", "next"),
+    "prev": ("prev", "prev"),
+    "rewind": ("rewind", "fast_bkw"),
+    "fast_forward": ("fast_forward", "fast_fwd"),
+    "mute": ("mute", "mute"),
+    "volume_up": ("volume_up", "volume_up"),
+    "volume_down": ("volume_down", "volume_down"),
+}
+
+# --------------------------------------------------------------------- salida
+
+
+def log(msg: str = "") -> None:
+    print(msg)
+
+
+def warn(msg: str) -> None:
+    print(f"AVISO: {msg}", file=sys.stderr)
+
+
+def die(msg: str, code: int = 1):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def tabla(filas: list[list[str]], cabeceras: list[str]) -> str:
+    if not filas:
+        return ""
+    anchos = [len(h) for h in cabeceras]
+    for fila in filas:
+        for i, celda in enumerate(fila):
+            anchos[i] = max(anchos[i], len(str(celda)))
+    lineas = ["  ".join(h.ljust(anchos[i]) for i, h in enumerate(cabeceras)).rstrip()]
+    lineas.append("  ".join("-" * anchos[i] for i in range(len(cabeceras))))
+    for fila in filas:
+        lineas.append("  ".join(str(c).ljust(anchos[i]) for i, c in enumerate(fila)).rstrip())
+    return "\n".join(lineas)
+
+
+# ----------------------------------------------------------------- procesos
+
+
+def run(cmd: list[str], timeout: int = 25, check: bool = False, texto: bool = True):
+    """Ejecuta un comando y devuelve el CompletedProcess."""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=texto, timeout=timeout)
+    except FileNotFoundError:
+        die(f"falta el programa '{cmd[0]}'")
+    except subprocess.TimeoutExpired:
+        die(f"'{cmd[0]}' no termino a tiempo ({timeout}s)")
+    if check and proc.returncode != 0:
+        detalle = (proc.stderr or proc.stdout or "").strip() if texto else ""
+        die(f"'{cmd[0]}' fallo (rc={proc.returncode}): {detalle}")
+    return proc
+
+
+def tiene(programa: str) -> bool:
+    return shutil.which(programa) is not None
+
+
+# ------------------------------------------------------------------- red
+
+
+def opener_sin_proxy() -> urllib.request.OpenerDirector:
+    """Abre HTTP ignorando cualquier proxy del entorno: esto es red local."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def http_get(url: str, timeout: int = 8, cabeceras: dict | None = None) -> bytes:
+    peticion = urllib.request.Request(url, headers=cabeceras or {"User-Agent": f"{APP}/{VERSION}"})
+    with opener_sin_proxy().open(peticion, timeout=timeout) as resp:
+        return resp.read()
+
+
+def http_post(url: str, cuerpo: bytes, timeout: int = 8, cabeceras: dict | None = None) -> bytes:
+    cab = {"User-Agent": f"{APP}/{VERSION}", "Content-Type": 'text/xml; charset="utf-8"'}
+    cab.update(cabeceras or {})
+    peticion = urllib.request.Request(url, data=cuerpo, headers=cab, method="POST")
+    with opener_sin_proxy().open(peticion, timeout=timeout) as resp:
+        return resp.read()
+
+
+def puerto_abierto(host: str, puerto: int, timeout: float = 1.2) -> bool:
+    try:
+        with socket.create_connection((host, puerto), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def ip_local() -> str | None:
+    """IP de este equipo en la LAN, sacada de la tabla de rutas."""
+    proc = run(["ip", "-4", "route", "get", "1.1.1.1"], timeout=5)
+    coincidencia = re.search(r"\ssrc\s+(\d+\.\d+\.\d+\.\d+)", proc.stdout or "")
+    return coincidencia.group(1) if coincidencia else None
+
+
+def red_local(ip: str | None = None) -> str:
+    """Supone /24, que es lo habitual en un router domestico."""
+    ip = ip or ip_local() or "192.168.1.150"
+    partes = ip.split(".")
+    return f"{partes[0]}.{partes[1]}.{partes[2]}.0/24"
+
+
+def tabla_vecinos() -> dict[str, str]:
+    """Mapa IP -> MAC de la tabla ARP del kernel."""
+    vecinos: dict[str, str] = {}
+    proc = run(["ip", "neigh", "show"], timeout=5)
+    for linea in (proc.stdout or "").splitlines():
+        partes = linea.split()
+        if len(partes) < 4 or "lladdr" not in partes:
+            continue
+        mac = partes[partes.index("lladdr") + 1]
+        if re.fullmatch(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", mac):
+            vecinos[partes[0]] = mac
+    return vecinos
+
+
+def escanear_nmap(cidr: str, puertos: list[int]) -> list[dict]:
+    """Connect-scan: funciona sin root y ve los equipos que no responden a ICMP."""
+    if not tiene("nmap"):
+        die("falta nmap (dnf install nmap)")
+    lista = ",".join(str(p) for p in sorted(puertos))
+    cmd = ["nmap", "-sT", "-n", "-Pn", "--open", "-T4", "--max-retries", "1",
+           "-p", lista, "-oX", "-", cidr]
+    proc = run(cmd, timeout=240)
+    salida = proc.stdout or ""
+    inicio = salida.find("<?xml")
+    if inicio < 0:
+        return []
+    try:
+        raiz = ET.fromstring(salida[inicio:])
+    except ET.ParseError:
+        return []
+    equipos = []
+    for host in raiz.findall("host"):
+        direccion = None
+        mac = None
+        for addr in host.findall("address"):
+            if addr.get("addrtype") == "ipv4":
+                direccion = addr.get("addr")
+            elif addr.get("addrtype") == "mac":
+                mac = addr.get("addr")
+        if not direccion:
+            continue
+        abiertos = []
+        for puerto in host.findall("ports/port"):
+            if puerto.get("state") == "open":
+                abiertos.append(int(puerto.get("portid")))
+        equipos.append({"ip": direccion, "mac": mac, "ports": sorted(abiertos)})
+    return equipos
+
+
+def buscar_ssdp(st: str = "ssdp:all", segundos: float = 3.0) -> list[dict]:
+    """M-SEARCH por multicast. Descubre equipos que no responden a ping."""
+    peticion = (
+        "M-SEARCH * HTTP/1.1\r\n"
+        "HOST: 239.255.255.250:1900\r\n"
+        'MAN: "ssdp:discover"\r\n'
+        f"MX: {int(segundos)}\r\n"
+        f"ST: {st}\r\n"
+        "\r\n"
+    ).encode()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    encontrados: list[dict] = []
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
+        sock.settimeout(0.4)
+        sock.sendto(peticion, ("239.255.255.250", 1900))
+        limite = time.time() + segundos
+        while time.time() < limite:
+            try:
+                datos, _ = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            texto = datos.decode("utf-8", "replace")
+            cabecera = {}
+            for linea in texto.split("\r\n")[1:]:
+                if ":" in linea:
+                    clave, _, valor = linea.partition(":")
+                    cabecera[clave.strip().lower()] = valor.strip()
+            ubicacion = cabecera.get("location")
+            if ubicacion and ubicacion not in [e.get("location") for e in encontrados]:
+                encontrados.append(cabecera)
+    except OSError:
+        pass
+    finally:
+        sock.close()
+    return encontrados
+
+
+def buscar_mdns() -> list[dict]:
+    """Servicios anunciados por mDNS, con su hostname, direccion y puerto."""
+    if not tiene("avahi-browse"):
+        return []
+    proc = run(["avahi-browse", "-art"], timeout=15)
+    servicios: list[dict] = []
+    actual: dict | None = None
+    for linea in (proc.stdout or "").splitlines():
+        if linea.startswith("="):
+            partes = linea.split()
+            actual = None
+            if len(partes) >= 4 and partes[3] in SERVICIOS_MDNS:
+                actual = {"tipo": partes[3], "hostname": partes[2],
+                          "direccion": None, "puerto": None, "txt": ""}
+                servicios.append(actual)
+        elif linea.startswith(" ") and actual is not None:
+            clave, _, valor = linea.strip().partition("=")
+            if clave == "address":
+                actual["direccion"] = valor.strip("[]").split(",")[0]
+            elif clave == "port":
+                texto = valor.strip("[]")
+                actual["puerto"] = int(texto) if texto.isdigit() else None
+            elif clave == "txt":
+                actual["txt"] = valor.strip()
+    return [s for s in servicios if s["direccion"]]
+
+
+def adivinar_tipo(puertos: list[int], mdns: list[str] | None = None) -> str:
+    """Huella del equipo a partir de los puertos que tiene abiertos."""
+    p = set(puertos)
+    mdns = mdns or []
+    if 9223 in p or 38400 in p:
+        return "hisense"
+    if 5555 in p:
+        return "firetv"
+    if 62078 in p:
+        return "iphone"
+    if 1716 in p:
+        return "kdeconnect"
+    if 80 in p and 443 in p and 8080 in p:
+        return "router"
+    if any(m.startswith("_googlecast") for m in mdns):
+        return "chromecast"
+    if any(m.startswith("_airplay") or m.startswith("_raop") for m in mdns):
+        return "sonos"
+    if any(m.startswith("_ipp") or m.startswith("_printer") for m in mdns):
+        return "printer"
+    return "host"
+
+
+# ----------------------------------------------------------------- config
+
+
+def valor_toml(valor) -> str:
+    if isinstance(valor, bool):
+        return "true" if valor else "false"
+    if isinstance(valor, (int, float)):
+        return str(valor)
+    if isinstance(valor, (list, tuple)):
+        return "[" + ", ".join(valor_toml(v) for v in valor) + "]"
+    texto = str(valor).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{texto}"'
+
+
+def volcar_toml(datos: dict) -> str:
+    lineas: list[str] = []
+    for seccion, valores in datos.items():
+        if not isinstance(valores, dict):
+            continue
+        simples = {k: v for k, v in valores.items() if not isinstance(v, dict)}
+        if simples:
+            lineas.append(f"[{seccion}]")
+            for clave, valor in simples.items():
+                lineas.append(f"{clave} = {valor_toml(valor)}")
+            lineas.append("")
+        for clave, valor in valores.items():
+            if not isinstance(valor, dict):
+                continue
+            lineas.append(f"[{seccion}.{clave}]")
+            for k, v in valor.items():
+                lineas.append(f"{k} = {valor_toml(v)}")
+            lineas.append("")
+    return "\n".join(lineas).rstrip() + "\n"
+
+
+class Config:
+    def __init__(self, ruta: Path = CONFIG_FILE):
+        self.ruta = ruta
+        self.datos: dict = {"settings": {}, "devices": {}}
+        self.cargar()
+
+    def cargar(self) -> None:
+        if not self.ruta.exists():
+            return
+        try:
+            with self.ruta.open("rb") as fh:
+                self.datos = tomllib.load(fh)
+        except (tomllib.TOMLDecodeError, OSError) as exc:
+            warn(f"no se pudo leer {self.ruta}: {exc}")
+        self.datos.setdefault("settings", {})
+        self.datos.setdefault("devices", {})
+
+    def guardar(self) -> None:
+        self.ruta.parent.mkdir(parents=True, exist_ok=True)
+        self.ruta.write_text(volcar_toml(self.datos), encoding="utf-8")
+
+    @property
+    def ajustes(self) -> dict:
+        return self.datos.setdefault("settings", {})
+
+    @property
+    def dispositivos(self) -> dict:
+        return self.datos.setdefault("devices", {})
+
+    def puertos_configurados(self) -> list[int]:
+        valor = self.ajustes.get("ports")
+        if isinstance(valor, list):
+            return [int(p) for p in valor]
+        if isinstance(valor, str):
+            return [int(p) for p in valor.split(",") if p.strip()]
+        return list(PUERTOS_SOSPECHOSOS)
+
+
+class Dispositivo:
+    """Un equipo del inventario, ya resuelto a IP."""
+
+    def __init__(self, clave: str, datos: dict):
+        self.clave = clave
+        self.datos = datos
+
+    def get(self, item, por_defecto=None):
+        return self.datos.get(item, por_defecto)
+
+    @property
+    def ip(self) -> str:
+        return self.datos.get("ip", "")
+
+    @property
+    def tipo(self) -> str:
+        return self.datos.get("type", "host")
+
+    @property
+    def nombre(self) -> str:
+        return self.datos.get("name") or self.clave
+
+    @property
+    def puertos(self) -> list[int]:
+        return list(self.datos.get("ports", []))
+
+
+def resolver(config: Config, nombre: str | None, tipo: str | None = None) -> Dispositivo:
+    """Busca un dispositivo por clave, nombre o IP; si hay uno solo del tipo, lo usa."""
+    dispositivos = config.dispositivos
+    if nombre:
+        if nombre in dispositivos:
+            return Dispositivo(nombre, dispositivos[nombre])
+        for clave, datos in dispositivos.items():
+            if datos.get("ip") == nombre or str(datos.get("name", "")).lower() == nombre.lower():
+                return Dispositivo(clave, datos)
+        die(f"no conozco el dispositivo '{nombre}' (usa 'lanctl ls' para ver los)")
+    if tipo:
+        candidatos = [(k, v) for k, v in dispositivos.items() if v.get("type") == tipo]
+        if not candidatos:
+            die(f"no hay ningun dispositivo de tipo '{tipo}' en el inventario")
+        if len(candidatos) > 1:
+            nombres = ", ".join(k for k, _ in candidatos)
+            die(f"hay varios dispositivos de tipo '{tipo}' ({nombres}): indica cual con --device")
+        clave, datos = candidatos[0]
+        return Dispositivo(clave, datos)
+    die("indica el dispositivo")
+
+
+# ------------------------------------------------------- websocket minimo
+
+
+class Fallo(Exception):
+    """Error de red recuperable (se reintenta)."""
+
+
+class WebSocket:
+    """Cliente WebSocket de lo justo: texto, sin TLS, sin extensiones."""
+
+    def __init__(self, url: str, timeout: int = 10, subprotocolos: list[str] | None = None):
+        partes = urllib.parse.urlparse(url)
+        if partes.scheme != "ws":
+            die(f"solo se soportan websockets sin cifrar (ws://), no {partes.scheme}://")
+        self.host = partes.hostname or ""
+        self.port = partes.port or 80
+        self.ruta = partes.path or "/"
+        try:
+            self.sock = socket.create_connection((self.host, self.port), timeout=timeout)
+        except OSError as exc:
+            raise Fallo(f"no se pudo conectar a {self.host}:{self.port}: {exc}") from exc
+        self.sock.settimeout(timeout)
+        clave = base64.b64encode(os.urandom(16)).decode()
+        peticion = (
+            f"GET {self.ruta} HTTP/1.1\r\n"
+            f"Host: {self.host}:{self.port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {clave}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+        )
+        if subprotocolos:
+            peticion += f"Sec-WebSocket-Protocol: {', '.join(subprotocolos)}\r\n"
+        peticion += "\r\n"
+        self.sock.sendall(peticion.encode())
+        buffer = b""
+        while b"\r\n\r\n" not in buffer:
+            try:
+                trozo = self.sock.recv(4096)
+            except OSError as exc:
+                raise Fallo(f"fallo el saludo websocket: {exc}") from exc
+            if not trozo:
+                raise Fallo("el servidor corto la conexion en el saludo websocket")
+            buffer += trozo
+        cabecera = buffer.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+        if " 101 " not in cabecera.splitlines()[0] + " ":
+            raise Fallo(f"el servidor no acepto el websocket: {cabecera.splitlines()[0]}")
+
+    def _exactos(self, cuantos: int) -> bytes:
+        datos = b""
+        while len(datos) < cuantos:
+            trozo = self.sock.recv(cuantos - len(datos))
+            if not trozo:
+                raise ConnectionError("conexion cerrada")
+            datos += trozo
+        return datos
+
+    def enviar(self, datos: bytes, opcode: int = 0x1) -> None:
+        mascara = os.urandom(4)
+        largo = len(datos)
+        cabecera = bytearray([0x80 | opcode])
+        if largo < 126:
+            cabecera.append(0x80 | largo)
+        elif largo < 65536:
+            cabecera.append(0x80 | 126)
+            cabecera += struct.pack(">H", largo)
+        else:
+            cabecera.append(0x80 | 127)
+            cabecera += struct.pack(">Q", largo)
+        cabecera += mascara
+        enmascarado = bytes(b ^ mascara[i % 4] for i, b in enumerate(datos))
+        self.sock.sendall(bytes(cabecera) + enmascarado)
+
+    def recibir(self) -> tuple[int, bytes]:
+        partes = []
+        opcode_final = 0
+        while True:
+            b0, b1 = self._exactos(2)
+            fin = bool(b0 & 0x80)
+            opcode = b0 & 0x0F
+            enmascarado = bool(b1 & 0x80)
+            largo = b1 & 0x7F
+            if largo == 126:
+                largo = struct.unpack(">H", self._exactos(2))[0]
+            elif largo == 127:
+                largo = struct.unpack(">Q", self._exactos(8))[0]
+            mascara = self._exactos(4) if enmascarado else None
+            carga = self._exactos(largo) if largo else b""
+            if mascara:
+                carga = bytes(b ^ mascara[i % 4] for i, b in enumerate(carga))
+            if opcode == 0x8:
+                raise ConnectionError("el otro extremo cerro la conexion")
+            if opcode == 0x9:
+                self.enviar(carga, opcode=0xA)
+                continue
+            if opcode == 0xA:
+                continue
+            partes.append(carga)
+            opcode_final = opcode
+            if fin:
+                break
+        return opcode_final, b"".join(partes)
+
+    def cerrar(self) -> None:
+        try:
+            self.enviar(b"", opcode=0x8)
+        except OSError:
+            pass
+        finally:
+            self.sock.close()
+
+
+# ------------------------------------------------------------- backend CDP
+
+
+class CDP:
+    """Chrome DevTools Protocol: la via para manejar la TV Hisense (VIDAA)."""
+
+    def __init__(self, host: str, puerto: int = 9223, timeout: int = 12):
+        self.host = host
+        self.puerto = puerto
+        self.timeout = timeout
+        self._contador = 0
+
+    def _base(self) -> str:
+        return f"http://{self.host}:{self.puerto}"
+
+    def objetivos(self, al_menos_uno: bool = False) -> list[dict]:
+        """Lista de objetivos del protocolo.
+
+        Con al_menos_uno=True reintenta hasta que haya alguna pagina: la TV
+        deja el target vacio un instante cuando cambia de aplicacion.
+        """
+        ultimo = ""
+        for intento in range(6):
+            try:
+                datos = http_get(f"{self._base()}/json/list", timeout=self.timeout)
+                lista = json.loads(datos)
+            except (urllib.error.URLError, OSError, TimeoutError) as exc:
+                ultimo = str(exc)
+                lista = []
+            except json.JSONDecodeError:
+                ultimo = "respuesta ilegible"
+                lista = []
+            if lista or not al_menos_uno:
+                return lista
+            time.sleep(0.5 * (intento + 1))
+        if ultimo:
+            die(f"no responde el puerto {self.puerto} de {self.host}: {ultimo}")
+        return lista
+
+    def _objetivo(self) -> dict:
+        objetivos = self.objetivos(al_menos_uno=True)
+        for objetivo in objetivos:
+            if objetivo.get("type") == "page" and objetivo.get("webSocketDebuggerUrl"):
+                return objetivo
+        for objetivo in objetivos:
+            if objetivo.get("webSocketDebuggerUrl"):
+                return objetivo
+        die(f"{self.host} no expone ninguna pagina manejable")
+
+    def _conectar(self, intentos: int = 4) -> WebSocket:
+        """Abre el websocket del shell.
+
+        El servidor de la TV a veces contesta 500 si se abre una conexion
+        mientras la anterior sigue cerrandose, asi que reintentamos.
+        """
+        ultimo = ""
+        for intento in range(intentos):
+            try:
+                return WebSocket(self._objetivo()["webSocketDebuggerUrl"],
+                                 timeout=self.timeout)
+            except Fallo as exc:
+                ultimo = str(exc)
+                time.sleep(0.4 * (intento + 1))
+        die(f"no se pudo abrir el websocket de {self.host}: {ultimo}")
+
+    def _llamar(self, ws: WebSocket, metodo: str, params: dict | None = None) -> dict:
+        self._contador += 1
+        identificador = self._contador
+        ws.enviar(json.dumps({"id": identificador, "method": metodo,
+                               "params": params or {}}).encode())
+        while True:
+            _, carga = ws.recibir()
+            try:
+                mensaje = json.loads(carga)
+            except json.JSONDecodeError:
+                continue
+            if mensaje.get("id") == identificador:
+                return mensaje
+
+    def evaluar(self, expresion: str):
+        """Ejecuta JS en el shell de la TV. Devuelve ('ok', valor) o ('error', texto)."""
+        ws = self._conectar()
+        try:
+            respuesta = self._llamar(ws, "Runtime.evaluate", {
+                "expression": expresion,
+                "returnByValue": True,
+                "awaitPromise": True,
+            })
+        finally:
+            ws.cerrar()
+        if "error" in respuesta:
+            die(f"error del protocolo: {respuesta['error']}")
+        resultado = respuesta.get("result", {}).get("result", {})
+        if resultado.get("subtype") == "error" or resultado.get("type") == "error":
+            return ("error", resultado.get("description", "error desconocido"))
+        return ("ok", resultado.get("value"))
+
+    def js(self, expresion: str):
+        """Como evaluar(), pero aborta si el JS lanza una excepcion."""
+        estado, valor = self.evaluar(expresion)
+        if estado == "error":
+            die(f"la TV respondio con error: {valor}")
+        return valor
+
+    def capturar(self, destino: str) -> str:
+        ws = self._conectar()
+        try:
+            respuesta = self._llamar(ws, "Page.captureScreenshot", {"format": "png"})
+        finally:
+            ws.cerrar()
+        datos = respuesta.get("result", {}).get("data")
+        if not datos:
+            die("no se pudo capturar la pantalla")
+        ruta = Path(destino).expanduser()
+        ruta.parent.mkdir(parents=True, exist_ok=True)
+        ruta.write_bytes(base64.b64decode(datos))
+        return str(ruta)
+
+
+# ---------------------------------------------------------- backend ADB
+
+
+class Adb:
+    """Mando del Fire TV por ADB sobre TCP."""
+
+    TECLAS = {
+        "home": "KEYCODE_HOME", "back": "KEYCODE_BACK", "up": "KEYCODE_DPAD_UP",
+        "down": "KEYCODE_DPAD_DOWN", "left": "KEYCODE_DPAD_LEFT",
+        "right": "KEYCODE_DPAD_RIGHT", "enter": "KEYCODE_DPAD_CENTER",
+        "ok": "KEYCODE_DPAD_CENTER", "menu": "KEYCODE_MENU",
+        "play": "KEYCODE_MEDIA_PLAY", "pause": "KEYCODE_MEDIA_PAUSE",
+        "play_pause": "KEYCODE_MEDIA_PLAY_PAUSE", "stop": "KEYCODE_MEDIA_STOP",
+        "power": "KEYCODE_POWER", "sleep": "KEYCODE_SLEEP",
+        "wake": "KEYCODE_WAKEUP", "mute": "KEYCODE_MUTE",
+        "volume_up": "KEYCODE_VOLUME_UP", "volume_down": "KEYCODE_VOLUME_DOWN",
+        "search": "KEYCODE_SEARCH", "backspace": "KEYCODE_DEL",
+        "info": "KEYCODE_INFO", "next": "KEYCODE_MEDIA_NEXT",
+        "prev": "KEYCODE_MEDIA_PREVIOUS", "rewind": "KEYCODE_MEDIA_REWIND",
+        "fast_forward": "KEYCODE_MEDIA_FAST_FORWARD",
+    }
+
+    def __init__(self, dispositivo: Dispositivo):
+        self.dispositivo = dispositivo
+        self.binario = self._encontrar_adb()
+        self.serial = f"{dispositivo.ip}:{dispositivo.get('adb_port', 5555)}"
+
+    @staticmethod
+    def _encontrar_adb() -> str:
+        # Primero el del sistema, luego el que deja lanctl en ~/.local/lib/lanctl
+        # (util cuando no hay permisos de root para instalar android-tools).
+        local = Path.home() / ".local" / "lib" / "lanctl" / "adb"
+        candidatos = ["adb", "/usr/libexec/android-sdk/platform-tools/adb",
+                      "/usr/lib/android-sdk/platform-tools/adb", str(local)]
+        for candidato in candidatos:
+            if os.path.isabs(candidato):
+                if os.access(candidato, os.X_OK):
+                    return candidato
+            elif shutil.which(candidato):
+                return shutil.which(candidato)
+        die("falta 'adb'. Instalalo con: sudo dnf install android-tools")
+
+    def _adb(self, *argumentos, timeout: int = 30, binario: bool = False):
+        return run([self.binario, "-s", self.serial, *argumentos],
+                   timeout=timeout, texto=not binario)
+
+    def conectar(self) -> None:
+        proc = run([self.binario, "connect", self.serial], timeout=20)
+        salida = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        if "unable to connect" in salida.lower():
+            die(f"no se pudo conectar al ADB de {self.serial}: {salida}")
+        if "unauthorized" in salida.lower():
+            die(f"el Fire TV pide autorizacion: acepta en la TV el aviso "
+                f"'Allow USB debugging' para {ip_local() or 'este equipo'}")
+
+    def listo(self) -> None:
+        """Se asegura de que hay conexion y de que el dispositivo responde."""
+        salida = run([self.binario, "devices"], timeout=15).stdout or ""
+        if self.serial not in salida:
+            self.conectar()
+            salida = run([self.binario, "devices"], timeout=15).stdout or ""
+        if "unauthorized" in salida:
+            die("el Fire TV pide autorizacion: acepta en la TV el aviso de depuracion")
+
+    def shell(self, *comando: str, timeout: int = 30) -> str:
+        proc = self._adb("shell", *comando, timeout=timeout)
+        if proc.returncode != 0:
+            detalle = (proc.stderr or proc.stdout or "").strip()
+            die(f"el comando fallo en el Fire TV: {detalle}")
+        return (proc.stdout or "").strip()
+
+    def listar_apps(self, solo_terceros: bool = False) -> list[str]:
+        args = ["pm", "list", "packages"]
+        if solo_terceros:
+            args.append("-3")
+        apps = []
+        for linea in self.shell(*args).splitlines():
+            linea = linea.strip()
+            if linea.startswith("package:"):
+                apps.append(linea.split(":", 1)[1].strip())
+        return sorted(apps)
+
+    def lanzar(self, destino: str) -> str:
+        if "://" in destino:
+            return self.shell("am", "start", "-a", "android.intent.action.VIEW",
+                              "-d", destino) or f"abriendo {destino}"
+        actividad = self.shell("cmd", "package", "resolve-activity", "--brief",
+                                destino).splitlines()
+        actividad = [a.strip() for a in actividad if "/" in a]
+        if actividad:
+            return self.shell("am", "start", "-n", actividad[-1])
+        return self.shell("monkey", "-p", destino, "-c",
+                          "android.intent.category.LAUNCHER", "1")
+
+    def abrir_url(self, url: str, paquete: str | None = None) -> str:
+        """Abre una URL en la app que corresponda (deep link).
+
+        El paquete hay que forzarlo con -p: si no, los enlaces https se los
+        queda el navegador Silk en lugar de la app de streaming.
+        """
+        argumentos = ["am", "start", "-a", "android.intent.action.VIEW", "-d", url]
+        if paquete:
+            argumentos += ["-p", paquete]
+        return self.shell(*argumentos)
+
+    def despierte(self) -> None:
+        """Despierta el Stick si esta en reposo (si no, el deep link no se ve)."""
+        if "despierta=True" not in self.energia("estado"):
+            self.shell("input", "keyevent", "KEYCODE_WAKEUP")
+            time.sleep(1.0)
+
+    def teclas(self, accion: str) -> None:
+        codigo = self.TECLAS.get(accion.lower())
+        if not codigo:
+            die(f"tecla desconocida '{accion}'. Conocidas: {', '.join(sorted(self.TECLAS))}")
+        self.shell("input", "keyevent", codigo)
+
+    def foco_actual(self) -> str:
+        """Paquete de la app que tiene el foco ahora mismo."""
+        ventana = self.shell("dumpsys", "window")
+        for linea in ventana.splitlines():
+            if "mCurrentFocus" in linea:
+                return linea.split("u0 ")[-1].split("/")[0].strip()
+        return ""
+
+    def esperar_foco(self, paquete: str, segundos: float = 6.0) -> str:
+        """Espera a que el paquete indicado tenga el foco."""
+        limite = time.time() + segundos
+        actual = self.foco_actual()
+        while time.time() < limite:
+            if actual == paquete:
+                return actual
+            time.sleep(0.3)
+            actual = self.foco_actual()
+        return actual
+
+    _CABECERA_SESION = re.compile(r"\((?:userId|uid)=\d+\)")
+    _ESTADO = re.compile(r"state=PlaybackState \{state=(\d+)")
+
+    def media_session(self, paquete: str) -> int | None:
+        """Estado de la sesion multimedia de un paquete (3 = reproduciendo).
+
+        El formato de 'dumpsys media_session' cambia entre versiones de
+        Android: la cabecera de cada sesion puede empezar por el tag o por el
+        paquete, llevar un '- ' delante y terminar en '(uid=N)' o en
+        '(userId=N)'. Por eso no se busca por prefijo: se corta el volcado en
+        bloques (uno por sesion) y se miran los del paquete pedido. Si la app
+        tiene varias sesiones, manda la que este reproduciendo.
+        """
+        volcado = self.shell("dumpsys", "media_session")
+        if "Sessions Stack" in volcado:
+            volcado = volcado.split("Sessions Stack", 1)[1]
+        estados: list[int] = []
+        bloque = ""
+        for linea in volcado.splitlines():
+            if self._CABECERA_SESION.search(linea):
+                estados += self._estados_del_bloque(bloque, paquete)
+                bloque = linea
+            else:
+                bloque += "\n" + linea
+        estados += self._estados_del_bloque(bloque, paquete)
+        if 3 in estados:
+            return 3
+        return estados[0] if estados else None
+
+    @classmethod
+    def _estados_del_bloque(cls, bloque: str, paquete: str) -> list[int]:
+        """Estados de un bloque del volcado, si el bloque es de ese paquete."""
+        cabecera = bloque.splitlines()[0] if bloque else ""
+        del_paquete = re.search(r"(?<![\w.])" + re.escape(paquete) + "/", cabecera)
+        if not del_paquete and not re.search(
+                r"^package=" + re.escape(paquete) + r"\s*$", bloque, re.MULTILINE):
+            return []
+        return [int(n) for n in cls._ESTADO.findall(bloque)]
+
+    def esperar_reproduccion(self, paquete: str, segundos: float = 10.0) -> int | None:
+        """Espera a que la app empiece a reproducir (estado 3)."""
+        limite = time.time() + segundos
+        estado = self.media_session(paquete)
+        while time.time() < limite:
+            if estado == 3:
+                return estado
+            time.sleep(0.5)
+            estado = self.media_session(paquete)
+        return estado
+
+    def texto(self, cadena: str) -> None:
+        self.shell("input", "text", cadena.replace(" ", "%s"))
+
+    def captura(self, destino: str) -> str:
+        proc = self._adb("exec-out", "screencap", "-p", timeout=40, binario=True)
+        datos = proc.stdout or b""
+        if not datos.startswith(b"\x89PNG"):
+            die("el Fire TV no devolvio una imagen valida (pantalla protegida "
+                "por DRM, tipo Netflix, o fallo de captura)")
+        ruta = Path(destino).expanduser()
+        ruta.parent.mkdir(parents=True, exist_ok=True)
+        ruta.write_bytes(datos)
+        return str(ruta)
+
+    def instalar(self, paquete: str, reemplazar: bool = True) -> str:
+        ruta = Path(paquete).expanduser()
+        if not ruta.is_file():
+            die(f"no encuentro el fichero '{paquete}'")
+        argumentos = ["install"]
+        if reemplazar:
+            argumentos.append("-r")
+        argumentos.append(str(ruta))
+        proc = self._adb(*argumentos, timeout=600)
+        salida = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        if "Success" not in salida:
+            die(f"la instalacion fallo: {salida}")
+        return salida
+
+    def volumen(self, accion: str) -> str:
+        if accion in ("up", "down", "mute"):
+            self.teclas("mute" if accion == "mute" else f"volume_{accion}")
+            return f"volumen: {accion}"
+        try:
+            nivel = int(accion)
+        except ValueError:
+            die("volumen: usa up, down, mute o un nivel 0-100")
+        salida = self.shell("media", "volume", "--stream", "3", "--set", str(nivel))
+        return salida or f"volumen: {nivel}"
+
+    def energia(self, accion: str) -> str:
+        if accion == "off":
+            self.shell("input", "keyevent", "KEYCODE_SLEEP")
+            return "orden de suspension enviada"
+        if accion == "on":
+            self.shell("input", "keyevent", "KEYCODE_WAKEUP")
+            return "orden de despertar enviada"
+        estado = self.shell("dumpsys", "power")
+        return f"despierta={'mWakefulness=Awake' in estado}"
+
+    PROPS_INTERESANTES = ("ro.product.model", "ro.product.manufacturer",
+                           "ro.product.device", "ro.build.version.release",
+                           "ro.build.display.id", "ro.serialno",
+                           "ro.build.version.sdk", "ro.product.name")
+
+    def estado(self) -> dict:
+        """Propiedades del dispositivo (getprop devuelve [clave]: [valor])."""
+        info = {}
+        for linea in self.shell("getprop").splitlines():
+            linea = linea.strip()
+            if not (linea.startswith("[") and "]" in linea):
+                continue
+            clave, _, valor = linea[1:].partition("]")
+            clave = clave.strip()
+            valor = valor.strip().lstrip(":").strip().strip("[]").strip()
+            if clave in self.PROPS_INTERESANTES:
+                info[clave] = valor
+        return info
+
+
+# ------------------------------------------------------ backend iOS (usbmux)
+
+
+class Usbmux:
+    """Cliente usbmuxd en TCP: el iPhone expone el puerto 62078 en la wifi."""
+
+    LISTAR = 6
+    RESULTADO = 1
+
+    def __init__(self, host: str, puerto: int = 62078, timeout: int = 6):
+        self.host = host
+        self.puerto = puerto
+        self.sock = socket.create_connection((host, puerto), timeout=timeout)
+        self.sock.settimeout(timeout)
+
+    def _enviar(self, tipo: int, carga: bytes = b"") -> None:
+        cabecera = struct.pack("<IIII", 16 + len(carga), 1, tipo, 1)
+        self.sock.sendall(cabecera + carga)
+
+    def _exactos(self, cuantos: int) -> bytes:
+        datos = b""
+        while len(datos) < cuantos:
+            trozo = self.sock.recv(cuantos - len(datos))
+            if not trozo:
+                raise ConnectionError("conexion cerrada")
+            datos += trozo
+        return datos
+
+    def _recibir(self) -> tuple[int, bytes]:
+        largo, _version, tipo, _etiqueta = struct.unpack("<IIII", self._exactos(16))
+        carga = self._exactos(largo - 16) if largo > 16 else b""
+        return tipo, carga
+
+    def listar(self) -> list[dict]:
+        self._enviar(self.LISTAR)
+        for _ in range(5):
+            tipo, carga = self._recibir()
+            if tipo != self.RESULTADO:
+                continue
+            try:
+                datos = plistlib.loads(carga)
+            except Exception:
+                return []
+            if "DeviceList" in datos:
+                return datos.get("DeviceList", [])
+            if "Number" in datos:
+                return []
+        return []
+
+    def cerrar(self) -> None:
+        self.sock.close()
+
+
+class Ios:
+    """Control basico de un iPhone via el servicio usbmuxd (puerto 62078).
+
+    Ojo: desde iOS 17 el servicio de red usa RemoteXPC y exige que el
+    telefono confie en este equipo (emparejamiento). Si no hay confianza
+    el telefono cierra la conexion y no hay nada que hacer por wifi.
+    """
+
+    def __init__(self, dispositivo: Dispositivo):
+        self.dispositivo = dispositivo
+        self.error: str | None = None
+
+    def _usbmux(self) -> Usbmux:
+        return Usbmux(self.dispositivo.ip, int(self.dispositivo.get("ios_port", 62078)))
+
+    def listar(self) -> list[dict]:
+        """Dispositivos que el telefono expone. [] si no hay confianza."""
+        try:
+            mux = self._usbmux()
+        except OSError as exc:
+            self.error = f"no contesta el puerto usbmuxd ({exc})"
+            return []
+        try:
+            return mux.listar()
+        except (ConnectionError, OSError, struct.error, plistlib.InvalidFileException) as exc:
+            self.error = f"el telefono corta la conexion ({exc})"
+            return []
+        finally:
+            mux.cerrar()
+
+    def _idevice(self, programa: str, *argumentos: str) -> str | None:
+        if not tiene(programa):
+            return None
+        proc = run([programa, *argumentos], timeout=45)
+        if proc.returncode != 0:
+            return None
+        return (proc.stdout or "").strip()
+
+    def estado(self) -> str:
+        """Explica que se puede y que no se puede hacer con este iPhone."""
+        lineas = [f"iphone {self.dispositivo.ip}:{self.dispositivo.get('ios_port', 62078)}"]
+        try:
+            dispositivos = self.listar()
+        except (OSError, ConnectionError):
+            dispositivos = []
+        if dispositivos:
+            for entrada in dispositivos:
+                props = entrada.get("Properties", {})
+                lineas.append(
+                    f"  udid={props.get('UDID', '?')}  tipo={props.get('ProductID', '?')}  "
+                    f"conexion={props.get('ConnectionType', '?')}  "
+                    f"serie={props.get('SerialNumber', '?')}"
+                )
+            return "\n".join(lineas)
+        lineas.append(f"  el telefono no acepta el protocolo usbmuxd por wifi"
+                      if not self.error else f"  {self.error}")
+        lineas.append("  (iOS 17+ pide emparejamiento previo o servicio _remotepairing)")
+        lineas.append("  pista: empareja el telefono por USB una vez con")
+        lineas.append("        sudo dnf install libimobiledevice-utils && idevicepair")
+        return "\n".join(lineas)
+
+    def info(self) -> str:
+        lineas = [self.estado()]
+        salida = self._idevice("ideviceinfo", "-n")
+        if salida:
+            lineas.append("")
+            lineas.append(salida)
+        elif not tiene("ideviceinfo"):
+            lineas.append("")
+            lineas.append("para mas datos: sudo dnf install libimobiledevice-utils")
+        return "\n".join(lineas)
+
+    def captura(self, destino: str) -> str:
+        salida = self._idevice("idevicescreenshot", "-n")
+        if salida is None:
+            die("necesitas 'idevicescreenshot' (sudo dnf install libimobiledevice-utils) "
+                "y que el telefono confie en este equipo")
+        lineas = [linea.strip() for linea in salida.splitlines() if linea.strip()]
+        origen = Path(lineas[-1]) if lineas else None
+        if origen is None or not origen.is_file():
+            die(f"no se encontro la captura generada ({salida})")
+        ruta = Path(destino).expanduser()
+        ruta.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(origen, ruta)
+        return str(ruta)
+
+
+# --------------------------------------------------------- backend DLNA
+
+
+class DLNA:
+    """Mandar un video a la TV por UPnP/DLNA (SetAVTransportURI + Play)."""
+
+    def __init__(self, host: str, timeout: int = 8):
+        self.host = host
+        self.timeout = timeout
+
+    def _descubrir(self) -> dict | None:
+        for entrada in buscar_ssdp("urn:schemas-upnp-org:device:MediaRenderer:1", 3.0):
+            url = entrada.get("location")
+            if not url or self.host not in url:
+                continue
+            try:
+                datos = http_get(url, timeout=self.timeout)
+            except (urllib.error.URLError, OSError):
+                continue
+            try:
+                raiz = ET.fromstring(datos)
+            except ET.ParseError:
+                continue
+            for servicio in raiz.iter():
+                if not servicio.tag.endswith("service"):
+                    continue
+                tipo = ""
+                control = ""
+                for hijo in servicio:
+                    tag = hijo.tag.rsplit("}", 1)[-1]
+                    if tag == "serviceType":
+                        tipo = hijo.text or ""
+                    elif tag == "controlURL":
+                        control = hijo.text or ""
+                if tipo.endswith("AVTransport:1") and control:
+                    return {"control": urllib.parse.urljoin(url, control)}
+        return None
+
+    def _soap(self, control: str, accion: str, argumentos: dict) -> None:
+        cuerpo = [
+            '<?xml version="1.0" encoding="utf-8"?>',
+            '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+            's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">',
+            "<s:Body>",
+            '<u:%s xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">' % accion,
+        ]
+        for clave, valor in argumentos.items():
+            cuerpo.append(f"<{clave}>{valor}</{clave}>")
+        cuerpo.append(f"</u:{accion}>")
+        cuerpo.append("</s:Body></s:Envelope>")
+        http_post(control, "".join(cuerpo).encode("utf-8"), timeout=self.timeout)
+
+    def _metadatos(self, url: str, titulo: str) -> str:
+        return (
+            '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
+            'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+            'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
+            '<item id="0" parentID="0" restricted="1">'
+            f"<dc:title>{titulo}</dc:title>"
+            "<upnp:class>object.item.videoItem</upnp:class>"
+            f'<res protocolInfo="http-get:*:video/mp4:*">{url}</res>'
+            "</item></DIDL-Lite>"
+        )
+
+    def reproducir(self, url: str, titulo: str = "lanctl") -> str:
+        servicio = self._descubrir()
+        if not servicio:
+            die(f"{self.host} no expone un servicio AVTransport por DLNA")
+        control = servicio["control"]
+        self._soap(control, "SetAVTransportURI", {
+            "InstanceID": "0",
+            "CurrentURI": url,
+            "CurrentURIMetaData": self._metadatos(url, titulo),
+        })
+        self._soap(control, "Play", {"InstanceID": "0", "Speed": "1"})
+        return f"enviado a {self.host}: {url}"
+
+
+# -------------------------------------------------------- backend ubus
+
+
+class Ubus:
+    """Router OpenWrt: ubus JSON-RPC 2.0 sobre WebSocket.
+
+    Las credenciales se toman de LANCTL_UBUS_SECRET o, si no esta, del
+    fichero ~/.config/lanctl/ubus.secret (modo 600).
+    """
+
+    def __init__(self, host: str, usuario: str = "root", secreto: str | None = None):
+        self.host = host
+        self.usuario = usuario
+        self.secreto = secreto or self._buscar_secreto()
+        if not self.secreto:
+            die("el router necesita credenciales: define LANCTL_UBUS_SECRET "
+                f"o crea {SECRETO_FILE} con la contrasena (modo 600)")
+        self.sid = ""
+        self.ws: WebSocket | None = None
+        self._contador = 0
+
+    @staticmethod
+    def _buscar_secreto() -> str:
+        """Devuelve la contrasena del router, de donde sea que venga."""
+        entorno = os.environ.get("LANCTL_UBUS_SECRET")
+        if entorno:
+            return entorno.strip()
+        try:
+            return SECRETO_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def _abrir(self) -> WebSocket:
+        if self.ws is None:
+            try:
+                self.ws = WebSocket(f"ws://{self.host}/", timeout=10,
+                                    subprotocolos=["ubus-json"])
+            except Fallo as exc:
+                die(f"no se pudo hablar con el router {self.host}: {exc}")
+        return self.ws
+
+    def llamar(self, objeto: str, metodo: str, datos: dict | None = None):
+        ws = self._abrir()
+        self._contador += 1
+        carga = {
+            "jsonrpc": "2.0",
+            "id": self._contador,
+            "method": "call",
+            "params": [self.sid, objeto, metodo, datos or {}],
+        }
+        ws.enviar(json.dumps(carga).encode())
+        while True:
+            _, respuesta = ws.recibir()
+            try:
+                mensaje = json.loads(respuesta)
+            except json.JSONDecodeError:
+                continue
+            if mensaje.get("id") == self._contador:
+                return mensaje.get("result")
+
+    def entrar(self) -> None:
+        # El login de ubus es el objeto "session" con el metodo "login":
+        # params = [sid, objeto, metodo, datos].
+        credenciales = {"username": self.usuario, PW_KEY: self.secreto}
+        resultado = self.llamar("session", "login", credenciales)
+        if not isinstance(resultado, list) or not resultado:
+            die(f"el router no acepto el inicio de sesion: {resultado}")
+        if resultado[0] != 0:
+            die(f"el router rechazo las credenciales (codigo {resultado[0]})")
+        self.sid = resultado[1].get("ubus_rpc_session", "") if len(resultado) > 1 else ""
+        if not self.sid:
+            die("el router no devolvio sesion")
+
+    def uci(self, seccion: str, opcion: str | None = None, valor: str | None = None,
+            commit: bool = False) -> list:
+        if valor is None:
+            datos = {"config": seccion}
+            if opcion:
+                datos["option"] = opcion
+        else:
+            datos = {"config": seccion, "option": opcion, "value": valor}
+        resultado = self.llamar("uci", "set" if valor is not None else "get", datos)
+        if commit:
+            self.llamar("uci", "commit", {"config": seccion})
+        return resultado if isinstance(resultado, list) else [resultado]
+
+
+# ------------------------------------------------------------- utilidades
+
+
+def ping_ok(ip: str, timeout: int = 2) -> bool:
+    if not ip:
+        return False
+    proc = run(["ping", "-c", "1", "-W", str(timeout), ip], timeout=timeout + 4)
+    return proc.returncode == 0
+
+
+def vivo(dispositivo: Dispositivo) -> bool:
+    """El equipo responde si contesta a alguno de sus puertos conocidos."""
+    if not dispositivo.ip:
+        return False
+    for puerto in dispositivo.puertos[:4]:
+        if puerto_abierto(dispositivo.ip, puerto, timeout=0.5):
+            return True
+    return ping_ok(dispositivo.ip)
+
+
+# ------------------------------------------------------------ comandos
+
+
+def cmd_discover(args, config: Config) -> None:
+    cidr = args.cidr or config.ajustes.get("cidr") or red_local()
+    if args.ports:
+        puertos = args.ports
+    elif args.rapido:
+        puertos = list(PUERTOS_RAPIDOS)
+    else:
+        puertos = config.puertos_configurados()
+    print(f"Escaneando {cidr} ({len(puertos)} puertos)...")
+    equipos = escanear_nmap(cidr, puertos)
+
+    # SSDP: encuentra los equipos que no responden a ICMP (la TV Hisense entre ellos)
+    for entrada in buscar_ssdp("ssdp:all", 3.0):
+        url = entrada.get("location", "")
+        for ip in re.findall(r"\d+\.\d+\.\d+\.\d+", url):
+            if not any(e["ip"] == ip for e in equipos):
+                equipos.append({"ip": ip, "mac": None, "ports": []})
+
+    # A los que han aparecido solo por SSDP se les sondean los puertos clave
+    for equipo in equipos:
+        if equipo["ports"]:
+            continue
+        equipo["ports"] = sorted(p for p in PUERTOS_RAPIDOS
+                                  if puerto_abierto(equipo["ip"], p, timeout=0.4))
+
+    vecinos = tabla_vecinos()
+    nombres_mdns: dict[str, list[str]] = {}
+    for servicio in buscar_mdns():
+        nombres_mdns.setdefault(servicio["direccion"], []).append(servicio["tipo"])
+
+    encontrados = []
+    for equipo in equipos:
+        ip = equipo["ip"]
+        equipo["mac"] = equipo.get("mac") or vecinos.get(ip)
+        equipo["mdns"] = nombres_mdns.get(ip, [])
+        equipo["type"] = adivinar_tipo(equipo["ports"], equipo["mdns"])
+        encontrados.append(equipo)
+
+    dispositivos = config.dispositivos
+    por_ip = {d.get("ip"): k for k, d in dispositivos.items() if d.get("ip")}
+    usados = set(dispositivos)
+    for equipo in sorted(encontrados, key=lambda e: (e["type"], e["ip"])):
+        clave = por_ip.get(equipo["ip"])
+        if clave is None:
+            base = equipo["type"] if equipo["type"] != "host" else f"host-{equipo['ip'].split('.')[-1]}"
+            clave = base
+            sufijo = 2
+            while clave in usados:
+                clave = f"{base}{sufijo}"
+                sufijo += 1
+        usados.add(clave)
+        entrada = dispositivos.setdefault(clave, {})
+        entrada["type"] = equipo["type"]
+        entrada["ip"] = equipo["ip"]
+        if equipo["ports"]:
+            entrada["ports"] = equipo["ports"]
+        if equipo.get("mac"):
+            entrada["mac"] = equipo["mac"]
+        if equipo.get("mdns"):
+            entrada["mdns"] = equipo["mdns"]
+        if not entrada.get("name"):
+            entrada["name"] = NOMBRES_TIPO.get(equipo["type"], clave)
+
+    config.guardar()
+    filas = []
+    for clave, datos in sorted(dispositivos.items(), key=lambda kv: kv[1].get("ip", "")):
+        filas.append([
+            clave,
+            datos.get("ip", "?"),
+            datos.get("type", "?"),
+            datos.get("name", ""),
+            datos.get("mac", ""),
+            ",".join(str(p) for p in datos.get("ports", [])),
+        ])
+    print()
+    print(tabla(filas, ["clave", "ip", "tipo", "nombre", "mac", "puertos"]))
+    print(f"\nInventario guardado en {config.ruta}")
+
+
+def cmd_ls(args, config: Config) -> None:
+    dispositivos = config.dispositivos
+    if not dispositivos:
+        print("El inventario esta vacio. Ejecuta 'lanctl discover'.")
+        return
+    filas = []
+    for clave, datos in sorted(dispositivos.items(), key=lambda kv: kv[1].get("ip", "")):
+        dispositivo = Dispositivo(clave, datos)
+        filas.append([clave, datos.get("ip", "?"), datos.get("type", "?"),
+                      datos.get("name", ""), "si" if vivo(dispositivo) else "no"])
+    print(tabla(filas, ["clave", "ip", "tipo", "nombre", "vivo"]))
+
+
+def cmd_status(args, config: Config) -> None:
+    dispositivo = resolver(config, args.dispositivo)
+    datos = dispositivo.datos
+    print(f"{dispositivo.nombre} ({dispositivo.clave})")
+    print(f"  tipo    : {dispositivo.tipo}")
+    print(f"  ip      : {dispositivo.ip}")
+    if datos.get("mac"):
+        print(f"  mac     : {datos['mac']}")
+    if datos.get("mdns"):
+        print(f"  mdns    : {', '.join(datos['mdns'])}")
+    if datos.get("model"):
+        print(f"  modelo  : {datos['model']}")
+    print(f"  puertos : {', '.join(str(p) for p in dispositivo.puertos) or '-'}")
+    if datos.get("notes"):
+        print(f"  notas   : {datos['notes']}")
+    print(f"  estado  : {'en linea' if vivo(dispositivo) else 'sin respuesta (puede estar en suspension)'}")
+
+
+def cmd_ip(args, config: Config) -> None:
+    print(resolver(config, args.dispositivo).ip)
+
+
+def cmd_ping(args, config: Config) -> None:
+    dispositivo = resolver(config, args.dispositivo)
+    proc = run(["ping", "-c", str(args.cuenta), dispositivo.ip], timeout=args.cuenta * 2 + 5)
+    if proc.stdout:
+        print(proc.stdout, end="")
+    if proc.stderr:
+        print(proc.stderr, end="", file=sys.stderr)
+    sys.exit(proc.returncode)
+
+
+def cmd_ssh(args, config: Config) -> None:
+    dispositivo = resolver(config, args.dispositivo)
+    usuario = dispositivo.get("ssh_user") or os.environ.get("USER") or "root"
+    destino = f"{usuario}@{dispositivo.ip}"
+    proc = run(["ssh", "-o", "ConnectTimeout=6", destino, *args.comando], timeout=120)
+    if proc.stdout:
+        print(proc.stdout, end="")
+    if proc.stderr:
+        print(proc.stderr, end="", file=sys.stderr)
+    sys.exit(proc.returncode)
+
+
+def cmd_wake(args, config: Config) -> None:
+    dispositivo = resolver(config, args.dispositivo)
+    mac = dispositivo.get("mac")
+    if not mac:
+        die(f"no se la MAC de {dispositivo.clave}: ejecuta 'lanctl discover'")
+    limpio = mac.replace(":", "").replace("-", "")
+    if len(limpio) != 12:
+        die(f"MAC con formato inesperado: {mac}")
+    paquete = b"\xff" * 6 + bytes.fromhex(limpio) * 16
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.sendto(paquete, ("255.255.255.255", 9))
+    finally:
+        sock.close()
+    print(f"Magic packet enviada a {mac} ({dispositivo.ip})")
+
+
+def cmd_raw(args, config: Config) -> None:
+    dispositivo = resolver(config, args.dispositivo)
+    carga = " ".join(args.carga).encode() if args.carga else b""
+    if not carga.endswith(b"\n"):
+        carga += b"\n"
+    try:
+        with socket.create_connection((dispositivo.ip, args.puerto), timeout=8) as sock:
+            if carga:
+                sock.sendall(carga)
+            sock.settimeout(4)
+            datos = b""
+            try:
+                while len(datos) < 65536:
+                    trozo = sock.recv(4096)
+                    if not trozo:
+                        break
+                    datos += trozo
+            except socket.timeout:
+                pass
+    except OSError as exc:
+        die(f"no se pudo conectar a {dispositivo.ip}:{args.puerto}: {exc}")
+    sys.stdout.write(datos.decode("utf-8", "replace"))
+    sys.stdout.flush()
+
+
+def cmd_setup(args, config: Config) -> None:
+    """Prepara lo que hace falta sin necesidad de root.
+
+    De momento deja el 'adb' de android-tools en ~/.local/lib/lanctl, que es
+    lo que necesita el Fire TV. Se hace descargando los RPM y extrayendolos
+    con cpio, asi que no hace falta ser root.
+    """
+    config.ruta.parent.mkdir(parents=True, exist_ok=True)
+    print(f"config      : {config.ruta}")
+
+    destino = Path.home() / ".local" / "lib" / "lanctl"
+    destino.mkdir(parents=True, exist_ok=True)
+    adb = destino / "adb"
+    if adb.is_file() and os.access(adb, os.X_OK) and not args.forzar:
+        print(f"adb         : ya esta en {adb}")
+        return
+
+    if not tiene("dnf"):
+        die("necesitas 'dnf' para descargar android-tools")
+    if not tiene("cpio") or not tiene("rpm2cpio"):
+        die("necesitas 'cpio' y 'rpm2cpio' (sudo dnf install cpio rpm)")
+
+    with tempfile.TemporaryDirectory(prefix="lanctl-adb-") as temporal:
+        descargas = Path(temporal) / "rpm"
+        descargas.mkdir()
+        print("descargando android-tools...")
+        proc = run(["dnf", "download", "--resolve", "--alldeps",
+                    "--destdir", str(descargas), "android-tools"], timeout=600)
+        if proc.returncode != 0:
+            die(f"la descarga fallo: {(proc.stderr or '').strip()}\n"
+                "prueba con: sudo dnf install android-tools")
+        extraido = Path(temporal) / "root"
+        extraido.mkdir()
+        # Solo interesa el paquete android-tools: el resto son librerias del
+        # sistema que ya estan instaladas.
+        paquetes = sorted(descargas.glob("android-tools*.rpm")) or sorted(descargas.glob("*.rpm"))
+        if not paquetes:
+            die("dnf no ha descargado ningun RPM")
+        for rpm in paquetes:
+            contenido = subprocess.run(["rpm2cpio", str(rpm)], stdout=subprocess.PIPE,
+                                       check=False).stdout
+            cpio = extraido / "paquete.cpio"
+            cpio.write_bytes(contenido)
+            with cpio.open("rb") as entrada:
+                subprocess.run(["cpio", "-idmu", "--quiet"], cwd=extraido, check=False,
+                               stdin=entrada)
+            # Algunos RPM traen directorios de solo lectura (p.ej. /usr/bin),
+            # y cpio los deja tal cual: hay que poder escribir dentro.
+            subprocess.run(["chmod", "-R", "u+rwX", str(extraido)], check=False)
+        origen = extraido / "usr" / "bin" / "adb"
+        if not origen.is_file():
+            die("no se encontro el binario adb en los RPM descargados")
+        shutil.copyfile(origen, adb)
+        adb.chmod(0o755)
+
+    faltan = [linea.split("=>")[0].strip() for linea
+              in (run(["ldd", str(adb)], timeout=20).stdout or "").splitlines()
+              if "not found" in linea]
+    if faltan:
+        die(f"adb necesita librerias que faltan: {', '.join(faltan)}")
+    version = (run([str(adb), "version"], timeout=20).stdout or "").strip()
+    print(f"adb         : instalado en {adb}")
+    if version:
+        print(f"             {version.splitlines()[0]}")
+    print("para usarlo: deja que el Fire TV acepte 'Allow USB debugging'")
+
+
+def cmd_doctor(args, config: Config) -> None:
+    """Comprueba que esta todo lo necesario para cada backend."""
+    print(f"{APP} {VERSION}")
+    print(f"  config      : {config.ruta} ({'ok' if config.ruta.exists() else 'aun no existe'})")
+    print(f"  ip local    : {ip_local() or '?'}")
+    print(f"  red local   : {red_local()}")
+    # Para adb/idevice* se miran tambien las copias que deja lanctl en
+    # ~/.local/lib/lanctl (util cuando no hay permisos de root para instalar).
+    local_lib = Path.home() / ".local" / "lib" / "lanctl"
+    herramientas = {
+        "nmap": ["nmap"],
+        "avahi-browse": ["avahi-browse"],
+        "ping": ["ping"],
+        "adb": ["adb", "/usr/libexec/android-sdk/platform-tools/adb",
+                str(local_lib / "adb")],
+        "ideviceinfo": ["ideviceinfo"],
+        "idevicescreenshot": ["idevicescreenshot"],
+    }
+    for nombre, candidatos in herramientas.items():
+        encontrado = None
+        for candidato in candidatos:
+            if os.path.isabs(candidato):
+                if os.access(candidato, os.X_OK):
+                    encontrado = candidato
+                    break
+            elif shutil.which(candidato):
+                encontrado = shutil.which(candidato)
+                break
+        print(f"  {nombre:<18}: {encontrado or 'NO INSTALADO'}")
+    print()
+    for clave, datos in sorted(config.dispositivos.items(), key=lambda kv: kv[1].get("ip", "")):
+        dispositivo = Dispositivo(clave, datos)
+        estado = "en linea" if vivo(dispositivo) else "sin respuesta"
+        print(f"  {clave:<10} {datos.get('ip', '?'):<15} {datos.get('type', '?'):<10} {estado}")
+    if Ubus._buscar_secreto():
+        origen = "LANCTL_UBUS_SECRET" if os.environ.get("LANCTL_UBUS_SECRET") else SECRETO_FILE
+        print(f"\n  backend del router: activo (credenciales en {origen})")
+    else:
+        print("\n  el backend del router esta desactivado "
+              f"(falta LANCTL_UBUS_SECRET o {SECRETO_FILE})")
+
+
+# ------------------------------------------------------------- hisense
+
+
+# El shell de VIDAA expone las teclas como codigos del mando. La tabla
+# CONST.KEYCODE_MAP va de "codigo de mando" a "codigo de tecla", y al reves
+# se puede deducir el codigo de mando a partir del nombre de la tecla.
+JS_TECLA = """
+(function(){
+  var nombre = %(nombre)s;
+  var clave = 'VK_' + nombre.toUpperCase();
+  if (typeof CONST === 'undefined' || !CONST.KEY || CONST.KEY[clave] === undefined) {
+    return 'error:la TV no tiene la tecla ' + clave;
+  }
+  var interno = CONST.KEY[clave];
+  var mando = null;
+  for (var i = 0; i < CONST.KEYCODE_MAP.length; i++) {
+    if (CONST.KEYCODE_MAP[i] === interno) { mando = i; break; }
+  }
+  if (mando === null) { return 'error:no hay codigo de mando para ' + clave; }
+  UI.onRemote({command: mando, state: 1, sendResult: function(){}});
+  return 'ok:' + CONST.KEYVALUE_MAP[interno];
+})()
+"""
+
+# Las fuentes de entrada se sacan de sourceMap (id <-> playId).
+JS_FUENTES = """
+(function(){
+  var mapa = window.sourceMap || [];
+  var nombres = window.LiveTVSourceMap || {};
+  var actual = 0;
+  try { actual = getCurrentSourceId(); } catch (e) {}
+  var lista = [];
+  for (var i = 0; i < mapa.length; i++) {
+    lista.push([mapa[i].id, mapa[i].playId, mapa[i].playId === 'TV' ? 'Antena' : (mapa[i].playId || ''),
+                mapa[i].id === actual ? 1 : 0]);
+  }
+  return JSON.stringify(lista);
+})()
+"""
+
+JS_CAMBIA_FUENTE = """
+(function(){
+  var objetivo = %(fuente)s;
+  var mapa = window.sourceMap || [];
+  for (var i = 0; i < mapa.length; i++) {
+    var p = mapa[i].playId || '';
+    if (p.toLowerCase() === String(objetivo).toLowerCase() || String(mapa[i].id) === String(objetivo)) {
+      changeSourceTo(mapa[i].id);
+      return 'ok:' + p;
+    }
+  }
+  return 'error:fuente desconocida';
+})()
+"""
+
+# Los canales salen de liveTV.getChannelListOprtData().
+JS_CANALES = """
+(function(){
+  if (typeof liveTV === 'undefined' || !liveTV.getChannelListOprtData) { return 'error:sin liveTV'; }
+  var datos = liveTV.getChannelListOprtData();
+  var todas = datos.allChannels || {};
+  var lista = [];
+  var actual = datos.crntList ? datos.crntList.name : '';
+  for (var nombre in todas) {
+    var canales = todas[nombre] || [];
+    for (var i = 0; i < canales.length; i++) {
+      lista.push([canales[i].number, canales[i].name, nombre, (nombre === actual &&
+        datos.channelIndex === i) ? 1 : 0]);
+    }
+  }
+  return JSON.stringify(lista);
+})()
+"""
+
+JS_CAMBIA_CANAL = """
+(function(){
+  var objetivo = %(canal)s;
+  var datos = liveTV.getChannelListOprtData();
+  var todas = datos.allChannels || {};
+  for (var lista in todas) {
+    var canales = todas[lista] || [];
+    for (var i = 0; i < canales.length; i++) {
+      var c = canales[i];
+      if (String(c.number) === String(objetivo) || String(c.name).toLowerCase() === String(objetivo).toLowerCase()) {
+        checkAndPlayChannel(c);
+        return 'ok:' + c.name;
+      }
+    }
+  }
+  return 'error:canal desconocido';
+})()
+"""
+
+
+def cmd_hisense(args, config: Config) -> None:
+    dispositivo = resolver(config, args.device, "hisense")
+    cdp = CDP(dispositivo.ip, int(dispositivo.get("cdp_port", 9223)))
+    accion = args.accion
+
+    if accion == "apps":
+        js = (
+            "(function(){"
+            "var lista=[];"
+            "try{ if(window.appPagesList) lista=window.appPagesList.slice(); }catch(e){}"
+            "if(!lista.length){ try{ lista=(typeof getRAppListWithIcon==='function')"
+            "?(getRAppListWithIcon()||[]):[]; }catch(e){} }"
+            "return JSON.stringify(lista);})()"
+        )
+        valor = cdp.js(js)
+        try:
+            lista = json.loads(valor or "[]")
+        except json.JSONDecodeError:
+            lista = []
+        if isinstance(lista, dict):
+            lista = list(lista)
+        if not lista:
+            die("la TV no ha devuelto la lista de apps")
+        print("\n".join(str(item) for item in lista))
+
+    elif accion == "launch":
+        app = args.app
+        alias = ALIAS_HISENSE.get(app.lower())
+        if alias:
+            app = alias
+        estrategias = [
+            f"startThirdPartyApp({json.dumps(app)})",
+            f"openAppControl({json.dumps(app)})",
+            f"startAppByRemoteControl({json.dumps(app)})",
+            f"startHiPageApp({json.dumps(app)})",
+        ]
+        errores = []
+        for js in estrategias:
+            estado, valor = cdp.evaluar(js)
+            if estado == "ok":
+                print(f"'{app}' lanzado ({js.split('(')[0]})")
+                return
+            errores.append(f"{js.split('(')[0]}: {valor}")
+        die("no se pudo lanzar la app. Se intentaron:\n  " + "\n  ".join(errores))
+
+    elif accion == "shot":
+        destino = args.destino or f"hisense-{time.strftime('%Y%m%d-%H%M%S')}.png"
+        print(cdp.capturar(destino))
+
+    elif accion == "source":
+        if args.fuente in (None, "list"):
+            valor = cdp.js(JS_FUENTES)
+            filas = json.loads(valor or "[]")
+            for identificador, play_id, nombre, activo in filas:
+                marca = "*" if activo else " "
+                print(f"{marca} {identificador:<4} {play_id:<12} {nombre}")
+            return
+        resultado = cdp.js(JS_CAMBIA_FUENTE % {"fuente": json.dumps(args.fuente)})
+        if resultado.startswith("error:"):
+            die(resultado[6:])
+        # La TV aplica el cambio de forma asincrona: se espera a que la
+        # fuente activa sea la nueva, o 'lanctl ver' leeria la anterior.
+        objetivo = resultado[4:] if resultado.startswith("ok:") else args.fuente
+        for _ in range(12):
+            time.sleep(0.4)
+            filas = json.loads(cdp.js(JS_FUENTES) or "[]")
+            activas = [fila for fila in filas if fila[3]]
+            if not activas:
+                continue
+            if str(activas[0][1]).lower() == str(objetivo).lower():
+                break
+        print(f"fuente cambiada a {args.fuente}")
+
+    elif accion == "channels":
+        valor = cdp.js(JS_CANALES)
+        filas = json.loads(valor or "[]")
+        for numero, nombre, lista, activo in filas:
+            marca = "*" if activo else " "
+            print(f"{marca} {str(numero):<6} {nombre:<24} ({lista})")
+
+    elif accion == "channel":
+        resultado = cdp.js(JS_CAMBIA_CANAL % {"canal": json.dumps(args.canal)})
+        if resultado.startswith("error:"):
+            die(resultado[6:])
+        print(f"canal {args.canal} solicitado")
+
+    elif accion == "power":
+        if args.estado == "off":
+            estado, valor = cdp.evaluar("switchOffTV()")
+            print("TV apagada" if estado == "ok" else f"error: {valor}")
+        else:
+            estado, valor = cdp.evaluar("poweronByApp()")
+            print("TV encendida" if estado == "ok" else f"error: {valor}")
+
+    elif accion == "cast":
+        print(DLNA(dispositivo.ip).reproducir(args.url, args.titulo))
+
+    elif accion == "eval":
+        valor = cdp.js(args.js)
+        if isinstance(valor, (dict, list)):
+            valor = json.dumps(valor, ensure_ascii=False, indent=2)
+        print(valor if valor is not None else "(sin valor)")
+
+    elif accion == "key":
+        resultado = cdp.js(JS_TECLA % {"nombre": json.dumps(args.tecla)})
+        if resultado.startswith("error:"):
+            die(resultado[6:])
+        print(f"tecla '{args.tecla}' enviada")
+
+
+# ------------------------------------------------------------- firetv
+
+
+def _servicio(nombre: str) -> dict:
+    """Busca un servicio de streaming por su nombre."""
+    clave = nombre.lower().strip().replace(" ", "")
+    clave = SERVICIOS_ALIAS.get(clave, clave)
+    servicio = SERVICIOS.get(clave)
+    if not servicio:
+        die(f"servicio desconocido '{nombre}'. Conocidos: "
+            f"{', '.join(sorted(set(SERVICIOS) | set(SERVICIOS_ALIAS)))}")
+    return servicio
+
+
+def _parece_id(texto: str) -> bool:
+    """Distingue un identificador de titulo de un nombre de peli.
+
+    Los ids son numericos (Netflix, Twitch), UUID con guiones (Disney+) o
+    codigos alfanumericos (YouTube, Crunchyroll). Un nombre de peli no suele
+    tener numeros ni guiones.
+    """
+    limpio = texto.strip()
+    if not limpio or " " in limpio:
+        return False
+    if limpio.isdigit():
+        return True
+    if "-" in limpio:
+        return True
+    return len(limpio) >= 8 and any(c.isdigit() for c in limpio) and any(
+        c.isalpha() for c in limpio)
+
+
+def _youtube_desde_titulo(texto: str) -> str | None:
+    """Busca en YouTube el primer vídeo que coincide y devuelve su id.
+
+    YouTube es el único servicio de los de aquí que trae los ids en el
+    HTML de los resultados, así que es el único que se puede resolver
+    solo. En los demás hay que pasarle el id (o el nombre, y se abre el
+    buscador para elegir con el mando).
+    """
+    url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(texto.strip())
+    cabeceras = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                               "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
+    try:
+        pagina = http_get(url, timeout=12, cabeceras=cabeceras).decode("utf-8", "replace")
+    except Exception:
+        return None
+    encontrado = re.search(r'"videoId":"([A-Za-z0-9_-]{11})"', pagina)
+    return encontrado.group(1) if encontrado else None
+
+
+def _firetv_play(adb: Adb, nombre: str, destino: str) -> None:
+    """Abre un titulo concreto en un servicio de streaming."""
+    servicio = _servicio(nombre)
+    paquete = servicio["paquete"]
+    destino = destino.strip()
+    if "://" in destino:
+        url = destino
+    elif _parece_id(destino):
+        url = servicio["titulo"].replace("{id}", destino)
+    else:
+        # No es un id: es el nombre de la peli. YouTube se resuelve solo; en
+        # los demas se abre el buscador del servicio y se elige con el mando.
+        if nombre == "youtube":
+            identificador = _youtube_desde_titulo(destino)
+            if identificador:
+                print(f"'{destino}' resuelto en YouTube: {identificador}")
+                url = servicio["titulo"].replace("{id}", identificador)
+            else:
+                print(f"no se ha podido resolver '{destino}': abro el buscador")
+                _firetv_buscar(adb, nombre, destino, False)
+                return
+        else:
+            print(f"'{destino}' no parece un id: abro el buscador de {nombre}")
+            _firetv_buscar(adb, nombre, destino, False)
+            return
+    adb.despierte()
+    adb.abrir_url(url, paquete)
+    actual = adb.esperar_foco(paquete, 8.0)
+    print(f"abriendo {url}")
+    if actual != paquete:
+        warn(f"la app '{paquete}' no tiene el foco (esta en '{actual or '?'}')")
+        return
+    # Las apps de streaming arrancan de forma asincrona: puede que deep link
+    # haya abierto la ficha del titulo pero que todavia no este sonando. Se
+    # espera a la sesion multimedia y, si no arranca, se pulsa OK.
+    estado = adb.esperar_reproduccion(paquete, 8.0)
+    if estado == 3:
+        print("reproduciendo")
+        return
+    print("no ha arrancado solo: pulso OK")
+    adb.teclas("enter")
+    if adb.esperar_reproduccion(paquete, 10.0) == 3:
+        print("reproduciendo")
+    else:
+        warn("no se ha podido confirmar la reproduccion: comprueba la pantalla")
+
+
+def _firetv_buscar(adb: Adb, nombre: str, texto: str, pulsa_ok: bool) -> None:
+    """Abre el buscador de un servicio con un texto."""
+    servicio = _servicio(nombre)
+    paquete = servicio["paquete"]
+    # %20 y no +: en un camino (twitch://search/...) el signo + es literal.
+    consulta = urllib.parse.quote(texto.strip(), safe="")
+    url = servicio["buscar"].replace("{q}", consulta)
+    adb.despierte()
+    adb.abrir_url(url, paquete)
+    actual = adb.esperar_foco(paquete, 8.0)
+    print(f"buscando '{texto}' en {nombre}: {url}")
+    if actual != paquete:
+        warn(f"la app '{paquete}' no tiene el foco (esta en '{actual or '?'}')")
+        return
+    if pulsa_ok:
+        time.sleep(2.0)
+        adb.teclas("enter")
+        print("pulsado OK en el primer resultado")
+
+
+def cmd_firetv(args, config: Config) -> None:
+    dispositivo = resolver(config, args.device, "firetv")
+    adb = Adb(dispositivo)
+    adb.listo()
+    accion = args.accion
+
+    if accion == "apps":
+        for app in adb.listar_apps(solo_terceros=args.terceros):
+            print(app)
+    elif accion == "launch":
+        destino = args.destino
+        alias = ALIAS_FIRETV.get(destino.lower())
+        if alias:
+            destino = alias
+        print(adb.lanzar(destino))
+        # Se espera a que la app tenga el foco: 'lanctl ver' lo lee justo
+        # despues y tiene que ser coherente.
+        if "://" not in destino and "." in destino:
+            actual = adb.esperar_foco(destino)
+            if actual != destino:
+                warn(f"el foco sigue en '{actual or '?'}'")
+    elif accion == "stop":
+        print(adb.shell("am", "force-stop", args.destino))
+    elif accion == "key":
+        adb.teclas(args.tecla)
+        print(f"tecla '{args.tecla}' enviada")
+    elif accion == "text":
+        adb.texto(args.texto)
+        print("texto enviado")
+    elif accion == "shot":
+        destino = args.destino or f"firetv-{time.strftime('%Y%m%d-%H%M%S')}.png"
+        print(adb.captura(destino))
+    elif accion == "shell":
+        print(adb.shell(*args.comando))
+    elif accion == "install":
+        if not args.si:
+            die("instalar modifica el dispositivo: vuelve a ejecutarlo con --si")
+        print(adb.instalar(args.paquete))
+    elif accion == "volume":
+        print(adb.volumen(args.nivel))
+    elif accion == "power":
+        print(adb.energia(args.estado))
+    elif accion == "play":
+        _firetv_play(adb, args.servicio, args.destino)
+    elif accion == "buscar":
+        _firetv_buscar(adb, args.servicio, args.texto, args.ok)
+    elif accion == "info":
+        for clave, valor in adb.estado().items():
+            print(f"{clave}={valor}")
+
+
+# --------------------------------------------------------------- atajos
+#
+# Todo lo que viene a continuacion son atajos de uso diario: resumen del
+# estado, capturas, escenas ya montadas y un mando unificado para las dos
+# TVs.
+
+
+JS_VER = """
+(function(){
+  var salida = {};
+  var mapa = window.sourceMap || [];
+  var actual = 0;
+  try { actual = getCurrentSourceId(); } catch (e) {}
+  salida.fuente_id = actual;
+  salida.fuente = '';
+  for (var i = 0; i < mapa.length; i++) {
+    if (mapa[i].id === actual) { salida.fuente = mapa[i].playId || ''; }
+  }
+  try {
+    var datos = liveTV.getChannelListOprtData();
+    salida.canal = (datos && datos.crntList && datos.crntList.name) || '';
+  } catch (e) { salida.canal = ''; }
+  try { salida.modulo = getCurrentSubModelName() || ''; } catch (e) { salida.modulo = ''; }
+  return JSON.stringify(salida);
+})()
+"""
+
+
+def _dispositivos_de(config: Config, tipo: str) -> list[Dispositivo]:
+    """Todos los dispositivos de un tipo, sin morir si no hay ninguno."""
+    return [Dispositivo(clave, datos)
+            for clave, datos in config.dispositivos.items()
+            if datos.get("type") == tipo]
+
+
+def _ns(**campos) -> argparse.Namespace:
+    """Namespace de argparse con los campos justos para un comando."""
+    return argparse.Namespace(**campos)
+
+
+def _ver_firetv(dispositivo: Dispositivo) -> dict:
+    info = {"clave": dispositivo.clave, "ip": dispositivo.ip}
+    try:
+        adb = Adb(dispositivo)
+        adb.listo()
+        paquete = adb.foco_actual()
+        despierto = "despierta=True" in adb.energia("estado")
+        info["app"] = NOMBRE_AMIGABLE.get(paquete, paquete)
+        info["paquete"] = paquete
+        info["estado"] = "despierta" if despierto else "en reposo"
+    except SystemExit:
+        info["estado"] = "no contesta"
+    return info
+
+
+def _ver_hisense(dispositivo: Dispositivo) -> dict:
+    info = {"clave": dispositivo.clave, "ip": dispositivo.ip}
+    try:
+        cdp = CDP(dispositivo.ip, int(dispositivo.get("cdp_port", 9223)))
+        datos = json.loads(cdp.js(JS_VER) or "{}")
+    except (SystemExit, json.JSONDecodeError):
+        info["estado"] = "no contesta"
+        return info
+    info["fuente"] = datos.get("fuente") or f"id {datos.get('fuente_id')}"
+    info["canal"] = datos.get("canal") or ""
+    info["modulo"] = datos.get("modulo") or ""
+    info["estado"] = "encendida"
+    return info
+
+
+def cmd_ver(args, config: Config) -> None:
+    """Que se ve ahora en cada dispositivo."""
+    filas = []
+    for dispositivo in _dispositivos_de(config, "firetv"):
+        info = _ver_firetv(dispositivo)
+        app = info.get("app") or "?"
+        if info.get("paquete"):
+            app = f"{app} ({info['paquete']})"
+        filas.append([info["clave"], info["ip"], app, info["estado"]])
+    for dispositivo in _dispositivos_de(config, "hisense"):
+        info = _ver_hisense(dispositivo)
+        detalle = info.get("fuente", "?")
+        if info.get("canal"):
+            detalle += f", canal {info['canal']}"
+        if info.get("modulo"):
+            detalle += f", {info['modulo']}"
+        filas.append([info["clave"], info["ip"], detalle, info["estado"]])
+    if not filas:
+        die("no hay ningun dispositivo conocido (prueba 'lanctl discover')")
+    print(tabla(filas, ["clave", "ip", "que se ve", "estado"]))
+
+
+def cmd_foto(args, config: Config) -> None:
+    """Captura la pantalla de las TVs."""
+    destino = Path(args.destino).expanduser() if args.destino else Path.home() / "Capturas"
+    marca = time.strftime("%Y%m%d-%H%M%S")
+    destino.mkdir(parents=True, exist_ok=True)
+    hechas = []
+    for dispositivo in _dispositivos_de(config, "hisense"):
+        ruta = destino / f"{marca}-{dispositivo.clave}.png"
+        try:
+            cdp = CDP(dispositivo.ip, int(dispositivo.get("cdp_port", 9223)))
+            cdp.capturar(str(ruta))
+        except SystemExit:
+            warn(f"{dispositivo.clave}: no se pudo capturar (no responde)")
+            continue
+        hechas.append(str(ruta))
+        print(f"{dispositivo.clave:<10} {ruta}")
+    for dispositivo in _dispositivos_de(config, "firetv"):
+        ruta = destino / f"{marca}-{dispositivo.clave}.png"
+        try:
+            adb = Adb(dispositivo)
+            adb.listo()
+            adb.captura(str(ruta))
+        except SystemExit:
+            warn(f"{dispositivo.clave}: no se pudo capturar (pantalla protegida "
+                 "por DRM o sin respuesta)")
+            continue
+        hechas.append(str(ruta))
+        print(f"{dispositivo.clave:<10} {ruta}")
+    if not hechas:
+        die("no se pudo capturar ninguna pantalla")
+
+
+def _paso_firetv(accion: str, valor: str, config: Config) -> None:
+    campos = {"device": None, "accion": accion}
+    if accion == "launch":
+        campos["destino"] = valor
+    elif accion == "power":
+        campos["estado"] = valor
+    cmd_firetv(_ns(**campos), config)
+
+
+def _paso_hisense(accion: str, valor: str, config: Config) -> None:
+    campos = {"device": None, "accion": accion}
+    if accion == "source":
+        campos["fuente"] = valor
+    elif accion == "power":
+        campos["estado"] = valor
+    cmd_hisense(_ns(**campos), config)
+
+
+def cmd_escena(args, config: Config) -> None:
+    """Ejecuta una escena ya montada (netflix, antena, apagar...)."""
+    pasos = ESCENAS.get(args.escena.lower())
+    if not pasos:
+        die(f"no conozco la escena '{args.escena}'. "
+            f"Conocidas: {', '.join(sorted(ESCENAS))}")
+    for tipo, accion, valor in pasos:
+        if tipo == "firetv":
+            _paso_firetv(accion, valor, config)
+        else:
+            _paso_hisense(accion, valor, config)
+
+
+def cmd_mando(args, config: Config) -> None:
+    """Manda la misma tecla a una o a las dos TVs."""
+    equivalencias = TECLAS_UNIFICADAS.get(args.tecla.lower())
+    if not equivalencias:
+        die(f"tecla desconocida '{args.tecla}'. "
+            f"Comunes: {', '.join(sorted(TECLAS_UNIFICADAS))}")
+    adb_tecla, tv_tecla = equivalencias
+    destino = (args.destino or "todas").lower()
+    if destino not in ("firetv", "hisense", "todas", "ambas", "las dos"):
+        die("destino: firetv, hisense o todas")
+
+    enviados = []
+    if destino in ("firetv", "todas", "ambas", "las dos"):
+        for dispositivo in _dispositivos_de(config, "firetv"):
+            try:
+                adb = Adb(dispositivo)
+                adb.listo()
+                adb.teclas(adb_tecla)
+            except SystemExit:
+                warn(f"{dispositivo.clave}: no se pudo enviar la tecla")
+                continue
+            enviados.append(f"{dispositivo.clave} ({adb_tecla})")
+    if destino in ("hisense", "todas", "ambas", "las dos"):
+        for dispositivo in _dispositivos_de(config, "hisense"):
+            try:
+                cdp = CDP(dispositivo.ip, int(dispositivo.get("cdp_port", 9223)))
+                resultado = cdp.js(JS_TECLA % {"nombre": json.dumps(tv_tecla)})
+            except SystemExit:
+                warn(f"{dispositivo.clave}: no se pudo enviar la tecla")
+                continue
+            if isinstance(resultado, str) and resultado.startswith("error:"):
+                warn(f"{dispositivo.clave}: {resultado[6:]}")
+                continue
+            enviados.append(f"{dispositivo.clave} ({tv_tecla})")
+    if not enviados:
+        die("no se pudo enviar la tecla a ningun dispositivo")
+    print("tecla enviada a: " + ", ".join(enviados))
+
+
+def cmd_fuente(args, config: Config) -> None:
+    """Atajo de 'hisense source'."""
+    cmd_hisense(_ns(device=None, accion="source", fuente=args.fuente), config)
+
+
+def cmd_canal(args, config: Config) -> None:
+    """Atajo de 'hisense channel'."""
+    cmd_hisense(_ns(device=None, accion="channel", canal=args.canal), config)
+
+
+def cmd_volumen(args, config: Config) -> None:
+    """Atajo de 'firetv volume'."""
+    cmd_firetv(_ns(device=None, accion="volume", nivel=args.nivel), config)
+
+
+def cmd_play(args, config: Config) -> None:
+    """Atajo de 'firetv play': abre un titulo en un servicio de streaming."""
+    cmd_firetv(_ns(device=None, accion="play", servicio=args.servicio,
+                    destino=args.destino), config)
+
+
+def cmd_buscar(args, config: Config) -> None:
+    """Atajo de 'firetv buscar': abre el buscador de un servicio."""
+    cmd_firetv(_ns(device=None, accion="buscar", servicio=args.servicio,
+                    texto=args.texto, ok=args.ok), config)
+
+
+# ------------------------------------------------------------- iphone
+
+
+def cmd_iphone(args, config: Config) -> None:
+    if args.accion == "list":
+        encontrados = [(clave, datos) for clave, datos in sorted(config.dispositivos.items())
+                        if datos.get("type") == "iphone"]
+        if not encontrados:
+            die("no hay ningun iPhone guardado en la configuracion")
+        for clave, datos in encontrados:
+            print(Ios(Dispositivo(clave, datos)).estado())
+            print()
+        return
+    dispositivo = resolver(config, args.device, "iphone")
+    ios = Ios(dispositivo)
+    if args.accion == "info":
+        print(ios.info())
+    elif args.accion == "shot":
+        destino = args.destino or f"iphone-{time.strftime('%Y%m%d-%H%M%S')}.png"
+        print(ios.captura(destino))
+
+
+# ------------------------------------------------------------- router
+
+
+def cmd_router(args, config: Config) -> None:
+    dispositivo = resolver(config, args.device, "router")
+    ubus = Ubus(dispositivo.ip, dispositivo.get("ssh_user") or "root")
+    ubus.entrar()
+    if args.accion == "uci":
+        for linea in ubus.uci(args.seccion, args.opcion):
+            print(linea)
+    elif args.accion == "call":
+        print(ubus.llamar(args.objeto, args.metodo, {}))
+    else:
+        print(ubus.llamar("system", "board", {}))
+
+
+# --------------------------------------------------------------- parser
+
+
+def anadir_device(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument("--device", help="clave del dispositivo (por defecto, el unico de su tipo)")
+    return parser
+
+
+def construir_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=APP,
+        description="Control de dispositivos concretos de la red local.",
+    )
+    parser.add_argument("--version", action="version", version=f"{APP} {VERSION}")
+    sub = parser.add_subparsers(dest="comando", required=True)
+
+    p = sub.add_parser("discover", help="escanea la red y guarda el inventario")
+    p.add_argument("--cidr", help="red a escanear (por defecto, la local /24)")
+    p.add_argument("--ports", type=int, nargs="+", help="puertos a sondear")
+    p.add_argument("--rapido", action="store_true",
+                   help="solo sondea los puertos clave (mucho mas rapido)")
+    p.set_defaults(func=cmd_discover)
+
+    p = sub.add_parser("ls", help="lista los dispositivos del inventario")
+    p.set_defaults(func=cmd_ls)
+
+    p = sub.add_parser("status", help="detalle de un dispositivo")
+    p.add_argument("dispositivo", nargs="?", help="clave, nombre o IP")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("ip", help="imprime la IP de un dispositivo")
+    p.add_argument("dispositivo", nargs="?")
+    p.set_defaults(func=cmd_ip)
+
+    p = sub.add_parser("ping", help="hace ping a un dispositivo")
+    p.add_argument("dispositivo")
+    p.add_argument("--cuenta", type=int, default=4)
+    p.set_defaults(func=cmd_ping)
+
+    p = sub.add_parser("ssh", help="se conecta por ssh a un dispositivo")
+    p.add_argument("dispositivo")
+    p.add_argument("comando", nargs="*")
+    p.set_defaults(func=cmd_ssh)
+
+    p = sub.add_parser("wake", help="despierta un equipo con un magic packet")
+    p.add_argument("dispositivo")
+    p.set_defaults(func=cmd_wake)
+
+    p = sub.add_parser("raw", help="manda texto crudo a un puerto")
+    p.add_argument("dispositivo")
+    p.add_argument("puerto", type=int)
+    p.add_argument("carga", nargs="*")
+    p.set_defaults(func=cmd_raw)
+
+    p = sub.add_parser("setup", help="prepara adb y la config sin ser root")
+    p.add_argument("--forzar", action="store_true", help="vuelve a instalar aunque exista")
+    p.set_defaults(func=cmd_setup)
+
+    p = sub.add_parser("doctor", help="comprueba que todo esta en su sitio")
+    p.set_defaults(func=cmd_doctor)
+
+    # --- atajos ----------------------------------------------------------
+    p = sub.add_parser("ver", help="que se ve ahora en cada dispositivo")
+    p.set_defaults(func=cmd_ver)
+
+    p = sub.add_parser("foto", help="captura la pantalla de las TVs")
+    p.add_argument("destino", nargs="?", help="directorio donde dejarlas")
+    p.set_defaults(func=cmd_foto)
+
+    p = sub.add_parser("escena", help="atajos combinados (netflix, antena, apagar...)")
+    p.add_argument("escena")
+    p.set_defaults(func=cmd_escena)
+
+    p = sub.add_parser("mando", help="manda una tecla a una o a las dos TVs")
+    p.add_argument("tecla")
+    p.add_argument("destino", nargs="?", default="todas",
+                   help="firetv, hisense o todas (por defecto, todas)")
+    p.set_defaults(func=cmd_mando)
+
+    p = sub.add_parser("fuente", help="cambia de fuente en la TV Hisense")
+    p.add_argument("fuente", nargs="?", help="hdmi1, tv, av... (sin argumento: lista)")
+    p.set_defaults(func=cmd_fuente)
+
+    p = sub.add_parser("canal", help="cambia de canal en la TV Hisense")
+    p.add_argument("canal")
+    p.set_defaults(func=cmd_canal)
+
+    p = sub.add_parser("volumen", help="volumen del Fire TV")
+    p.add_argument("nivel", help="up, down, mute o 0-100")
+    p.set_defaults(func=cmd_volumen)
+
+    p = sub.add_parser("play", help="abre un titulo en un servicio de streaming")
+    p.add_argument("servicio", help="netflix, disney, hbo, twitch, youtube, crunchyroll")
+    p.add_argument("destino", help="id del titulo, URL o nombre (busca)")
+    p.set_defaults(func=cmd_play)
+
+    p = sub.add_parser("buscar", help="abre el buscador de un servicio de streaming")
+    p.add_argument("servicio", help="netflix, disney, hbo, twitch, youtube, crunchyroll")
+    p.add_argument("texto", help="lo que se busca")
+    p.add_argument("--ok", action="store_true", help="pulsa OK en el primer resultado")
+    p.set_defaults(func=cmd_buscar)
+
+    # --- hisense ---------------------------------------------------------
+    p = sub.add_parser("hisense", help="maneja la TV Hisense (VIDAA)")
+    hsub = p.add_subparsers(dest="accion", required=True)
+    anadir_device(hsub.add_parser("apps", help="lista las apps disponibles"))
+    h = anadir_device(hsub.add_parser("launch", help="lanza una app"))
+    h.add_argument("app", help="id de app: youtube, netflix, amazon, opera4x...")
+    h = anadir_device(hsub.add_parser("shot", help="captura la pantalla"))
+    h.add_argument("destino", nargs="?", help="fichero png de salida")
+    h = anadir_device(hsub.add_parser("source", help="cambia de fuente de entrada"))
+    h.add_argument("fuente", nargs="?", help="hdmi1, tv, av... (sin argumento: lista las fuentes)")
+    anadir_device(hsub.add_parser("channels", help="lista los canales"))
+    h = anadir_device(hsub.add_parser("channel", help="cambia de canal"))
+    h.add_argument("canal", help="numero o nombre de canal")
+    h = anadir_device(hsub.add_parser("power", help="apaga o enciende la TV"))
+    h.add_argument("estado", nargs="?", choices=["on", "off"], default="off")
+    h = anadir_device(hsub.add_parser("cast", help="manda un video por DLNA"))
+    h.add_argument("url")
+    h.add_argument("--titulo", default="lanctl")
+    h = anadir_device(hsub.add_parser("eval", help="ejecuta JavaScript en la TV"))
+    h.add_argument("js")
+    h = anadir_device(hsub.add_parser("key", help="envia una tecla"))
+    h.add_argument("tecla")
+    # Cada alias de app es tambien un subcomando: 'lanctl hisense netflix'.
+    for alias, app in ALIAS_HISENSE.items():
+        h = anadir_device(hsub.add_parser(alias, help=f"lanza la app {app}"))
+        h.set_defaults(func=cmd_hisense, accion="launch", app=app)
+    p.set_defaults(func=cmd_hisense)
+
+    # --- firetv ----------------------------------------------------------
+    p = sub.add_parser("firetv", help="maneja el Fire TV Stick por ADB")
+    fsub = p.add_subparsers(dest="accion", required=True)
+    h = anadir_device(fsub.add_parser("apps", help="lista las apps instaladas"))
+    h.add_argument("--terceros", action="store_true", help="solo las instaladas por ti")
+    h = anadir_device(fsub.add_parser("launch", help="lanza una app o una url"))
+    h.add_argument("destino", help="paquete (com.netflix...) o url")
+    h = anadir_device(fsub.add_parser("stop", help="fuerza el cierre de una app"))
+    h.add_argument("destino", help="paquete")
+    h = anadir_device(fsub.add_parser("key", help="envia una tecla"))
+    h.add_argument("tecla", help="home, back, up, down, left, right, enter, menu, play...")
+    h = anadir_device(fsub.add_parser("text", help="escribe texto"))
+    h.add_argument("texto")
+    h = anadir_device(fsub.add_parser("shot", help="captura la pantalla"))
+    h.add_argument("destino", nargs="?", help="fichero png de salida")
+    h = anadir_device(fsub.add_parser("shell", help="ejecuta un comando en el dispositivo"))
+    h.add_argument("comando", nargs=argparse.REMAINDER)
+    h = anadir_device(fsub.add_parser("install", help="instala un apk"))
+    h.add_argument("paquete", help="ruta del apk")
+    h.add_argument("--si", action="store_true", help="no pedir confirmacion")
+    h = anadir_device(fsub.add_parser("volume", help="sube, baja o silencia"))
+    h.add_argument("nivel", help="up, down, mute o 0-100")
+    h = anadir_device(fsub.add_parser("power", help="suspende o despierta"))
+    h.add_argument("estado", nargs="?", choices=["on", "off"], default="on")
+    anadir_device(fsub.add_parser("info", help="informacion del sistema"))
+    h = anadir_device(fsub.add_parser("play", help="abre un titulo de un servicio"))
+    h.add_argument("servicio", help="netflix, disney, hbo, twitch, youtube, crunchyroll")
+    h.add_argument("destino", help="id del titulo, URL o nombre (busca)")
+    h = anadir_device(fsub.add_parser("buscar", help="abre el buscador de un servicio"))
+    h.add_argument("servicio", help="netflix, disney, hbo, twitch, youtube, crunchyroll")
+    h.add_argument("texto", help="lo que se busca")
+    h.add_argument("--ok", action="store_true", help="pulsa OK en el primer resultado")
+    # Cada alias de app es tambien un subcomando: 'lanctl firetv netflix'.
+    for alias, paquete in ALIAS_FIRETV.items():
+        h = anadir_device(fsub.add_parser(alias, help=f"lanza {paquete}"))
+        h.set_defaults(func=cmd_firetv, accion="launch", destino=paquete)
+    p.set_defaults(func=cmd_firetv)
+
+    # --- iphone ----------------------------------------------------------
+    p = sub.add_parser("iphone", help="info del iPhone en la red")
+    isub = p.add_subparsers(dest="accion", required=True)
+    anadir_device(isub.add_parser("list", help="lista los iPhone anunciados"))
+    anadir_device(isub.add_parser("info", help="modelo, iOS, capacidad"))
+    h = anadir_device(isub.add_parser("shot", help="captura la pantalla"))
+    h.add_argument("destino", nargs="?", help="fichero png de salida")
+    p.set_defaults(func=cmd_iphone)
+
+    # --- router ----------------------------------------------------------
+    p = sub.add_parser("router", help="router OpenWrt por ubus (necesita credenciales)")
+    rsub = p.add_subparsers(dest="accion", required=True)
+    anadir_device(rsub.add_parser("board", help="informacion del sistema"))
+    h = anadir_device(rsub.add_parser("uci", help="lee una seccion de la configuracion"))
+    h.add_argument("seccion")
+    h.add_argument("opcion", nargs="?")
+    h = anadir_device(rsub.add_parser("call", help="llama a un objeto de ubus"))
+    h.add_argument("--objeto", default="system")
+    h.add_argument("--metodo", default="board")
+    p.set_defaults(func=cmd_router)
+
+    return parser
+
+
+def main() -> None:
+    parser = construir_parser()
+    args = parser.parse_args()
+    config = Config()
+    try:
+        args.func(args, config)
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

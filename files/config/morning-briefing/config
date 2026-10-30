@@ -1,0 +1,45 @@
+# Ajustes del saludo matinal con voz (scripts/morning-briefing).
+#
+# El script carga este fichero como si fuera un fragmento de shell: lo que
+# se declare aqui gana a los valores por defecto del script.
+
+# --- sitio ---
+# La ubicacion NO se versiona: este repo es publico y unas coordenadas
+# exactas dicen donde vives. Se define en el fichero local
+# (~/.config/morning-briefing/local.conf), que el script carga justo
+# despues de este y que no esta enlazado al repositorio.
+#
+#   CIUDAD="tu-ciudad"   # como se dice en el parte
+#   LAT="00.0000"        # coordenadas fijas: sin geocodificar
+#   LON="0.00000"
+#
+# Sin local.conf, la ubicacion se detecta por IP, que suele dar una zona
+# demasiado general pero no delata nada.
+CIUDAD=""
+LAT=""
+LON=""
+
+# --- espera tras el arranque de la sesion (segundos) ---
+# Da tiempo a que el audio y la red esten listos. Con 25 s se hacia tarde;
+# 15 s sigue dando margen y, si aun asi no hay red, el script reintenta.
+DELAY=15
+
+# --- cuantos titulares se leen al LLM ---
+MAX_TITULARES=6
+
+# --- mercados: simbolo|nombre hablado ---
+# Cuatro indices: con cinco el parte se alargaba demasiado.
+MERCADOS=(
+  "^IBEX|el Ibex 35"
+  "^SPX|el S P 500"
+  "^IXIC|el Nasdaq"
+  "BTC-USD|el Bitcoin"
+)
+
+# --- fuentes RSS: el orden importa, el resumen prioriza los primeros ---
+FUENTES=(
+  "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"
+  "https://www.investing.com/rss/news_25.rss"
+  "https://feeds.bbci.co.uk/news/business/rss.xml"
+  "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/portada"
+)

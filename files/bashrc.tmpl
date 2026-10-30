@@ -1,0 +1,51 @@
+# .bashrc
+
+# Source global definitions
+if [ -f /etc/bashrc ]; then
+    . /etc/bashrc
+fi
+
+# User specific environment
+if ! [[ "$PATH" =~ "$HOME/.local/bin:$HOME/bin:" ]]; then
+    PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+fi
+export PATH
+
+# Uncomment the following line if you don't like systemctl's auto-paging feature:
+# export SYSTEMD_PAGER=
+
+# User specific aliases and functions
+if [ -d ~/.bashrc.d ]; then
+    for rc in ~/.bashrc.d/*; do
+        if [ -f "$rc" ]; then
+            . "$rc"
+        fi
+    done
+fi
+unset rc
+
+# fastfetch (solo si esta instalado)
+if command -v fastfetch >/dev/null 2>&1; then
+    fastfetch
+fi
+
+# cargo (solo si el usuario lo tiene instalado en ~/.cargo/bin)
+if [ -d "$HOME/.cargo/bin" ]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+fi
+
+#JAVA_HOME (solo si hay java instalado)
+if command -v java >/dev/null 2>&1; then
+    JAVA_HOME=$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")
+    export JAVA_HOME
+    export PATH="$JAVA_HOME/bin:$PATH"
+fi
+
+# opencode (solo si el directorio existe)
+if [ -d "__HOME__/.opencode/bin" ]; then
+    export PATH="__HOME__/.opencode/bin:$PATH"
+fi
+
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion

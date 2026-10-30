@@ -1,0 +1,794 @@
+#!/usr/bin/env bash
+# morning-briefing — saludo matinal hablado
+#
+# Dice la fecha, la hora, el tiempo, la bolsa y un resumen de las noticias
+# cuando arranca la sesion, una sola vez al dia. El sello del ultimo parte
+# queda en ~/.local/state/morning-briefing/last-run y SOLO lo escribe el
+# arranque automatico: hablar a mano no gasta el saludo del dia.
+#
+#   morning-briefing [--autostart] [--now] [--dry-run] [--reset] [--ayuda]
+#
+#     --autostart  lo usa el arranque de sesion (unico modo que sella el dia)
+#     --now        habla aunque hoy ya se haya hablado
+#     --dry-run    imprime el texto y NO suena
+#     --reset      borra el sello del dia
+#     --ayuda, -h  esta ayuda
+#
+# Dependencias: bash, curl, jq, python3, piper, ffmpeg, pw-play.
+# Todo fallo es opcional: sin red saluda solo con la fecha y la hora, y sin
+# audio deja el aviso en pantalla sin romper nada.
+#
+# La voz es la misma que la del plugin opencode-voice-tts: piper con el
+# modelo es_ES-davefx-medium y la cadena de ffmpeg del preset K2 (variable
+# CADENA_K2, mas abajo). Si esa cadena cambia en el plugin, hay que copiarla
+# aqui: esta en PRESETS.k2 de
+# files/config/opencode/plugins/opencode-voice-tts/index.js.
+set -Eeuo pipefail
+
+# El autostart de Plasma arranca con un PATH minimo: se fija aqui.
+export PATH="/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:${PATH}"
+export LC_ALL="es_ES.UTF-8"
+
+# ==========================================================================
+# Rutas y valores por defecto
+# ==========================================================================
+
+HOME_DIR="${HOME}"
+STATE_DIR="${XDG_STATE_HOME:-${HOME_DIR}/.local/state}/morning-briefing"
+CONF_DIR="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}/morning-briefing"
+CONF_FILE="${CONF_DIR}/config"
+LOG_FILE="${STATE_DIR}/briefing.log"
+LAST_RUN="${STATE_DIR}/last-run"
+LAST_TEXT="${STATE_DIR}/last.txt"
+
+# Tope del registro: al pasarse, se tira la mitad mas antigua. Son ~1 KB por
+# arranque; sin tope creceria para siempre.
+LOG_MAX_LINEAS=400
+
+PIPER="${OPENCODE_VOICE_PIPER:-${HOME_DIR}/.local/bin/piper}"
+MODEL="${OPENCODE_VOICE_MODEL:-${HOME_DIR}/.local/share/piper-voices/es_ES-davefx-medium.onnx}"
+FFMPEG="${OPENCODE_VOICE_FFMPEG:-ffmpeg}"
+PLAYER="${OPENCODE_VOICE_PLAYER:-pw-play}"
+
+LLM_URL="${OPENCODE_VOICE_LLM_URL:-http://localhost:11434/api/chat}"
+LLM_MODEL="${OPENCODE_VOICE_LLM_MODEL:-gemma4:12b}"
+
+# Espera tras el arranque de la sesion: da tiempo a que el audio y la red
+# esten listos. Solo se aplica en el arranque automatico.
+DELAY=25
+
+# Cadena de ffmpeg del preset K2 (la voz asignada). Copia de la que usa el
+# plugin opencode-voice-tts.
+CADENA_K2="highpass=f=90,rubberband=tempo=0.96:pitch=0.8:formant=preserved,aecho=0.8:0.8:22|44|70:0.35|0.22|0.12,equalizer=f=180:g=4:width_type=q:width=1.2,equalizer=f=1100:g=3:width_type=q:width=1.2,equalizer=f=3400:g=4:width_type=q:width=1,tremolo=f=7:d=0.06,deesser=i=0.15:m=0.4:f=0.5,acompressor=threshold=-20dB:ratio=3:attack=5:release=150,loudnorm=I=-16:TP=-1.5:LRA=11,"
+
+# Fuentes de noticias (RSS) y mercados (Yahoo Finance).
+# El orden de FUENTES importa: las de bolsa van primero porque el resumen
+# prioriza los titulares que aparecen antes.
+FUENTES=(
+    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"
+    "https://www.investing.com/rss/news_25.rss"
+    "https://feeds.bbci.co.uk/news/business/rss.xml"
+    "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/portada"
+)
+MERCADOS=(
+    "^IBEX|el Ibex 35"
+    "^SPX|el S P 500"
+    "^DJI|el Dow Jones"
+    "^IXIC|el Nasdaq"
+    "BTC-USD|el Bitcoin"
+)
+MAX_TITULARES=6
+
+# Ubicacion para el tiempo: vacia = se detecta por IP.
+CIUDAD=""
+LAT=""
+LON=""
+
+# ==========================================================================
+# Configuracion del usuario (~/.config/morning-briefing/config)
+# ==========================================================================
+
+# Se carga despues de los valores por defecto, asi que manda lo que diga el
+# fichero. Se acepta la ruta antigua (~/.config/morning-briefing.conf)
+# mientras exista, para no romper una instalacion sin migrar.
+if [[ ! -r "${CONF_FILE}" && -r "${CONF_DIR}.conf" ]]; then
+    CONF_FILE="${CONF_DIR}.conf"
+fi
+if [[ -r "${CONF_FILE}" ]]; then
+    # shellcheck source=/dev/null
+    source "${CONF_FILE}"
+fi
+
+# Ajustes que no pueden vivir en el repositorio (es publico): sobre todo la
+# ubicacion. Se carga despues, asi que manda sobre lo anterior. No se enlaza
+# desde el repo: es un fichero normal de ~/.config/morning-briefing/.
+if [[ -r "${CONF_DIR}/local.conf" ]]; then
+    # shellcheck source=/dev/null
+    source "${CONF_DIR}/local.conf"
+fi
+
+# ==========================================================================
+# Estado del parte (lo rellenan las funciones de datos)
+# ==========================================================================
+
+UBIC_LAT=""
+UBIC_LON=""
+UBIC_NOMBRE=""
+
+TIEMPO_TEMP=""
+TIEMPO_CODIGO=""
+TIEMPO_TMAX=""
+TIEMPO_TMIN=""
+TIEMPO_PROB=""
+
+FRASE_BOLSA=""
+FRASE_NOTICIAS=""
+
+SALUDO=""
+FECHA_LARGA=""
+HORA_TEXTO=""
+
+VERBOSO=0
+
+# ==========================================================================
+# Utilidades
+# ==========================================================================
+
+TMP_DIRS=()
+
+limpiar_tmp() {
+    local d
+    for d in ${TMP_DIRS[@]+"${TMP_DIRS[@]}"}; do
+        [[ -n "${d}" ]] && rm -rf -- "${d}"
+    done
+    TMP_DIRS=()
+    return 0
+}
+trap limpiar_tmp EXIT
+
+# Crea un directorio temporal que se borra al salir.
+tmpdir() {
+    local d
+    d="$(mktemp -d "${TMPDIR:-/tmp}/morning-briefing.XXXXXX")"
+    TMP_DIRS+=("${d}")
+    printf '%s' "${d}"
+}
+
+# Recorta el registro al arrancar (no en cada linea: es mas barato).
+rotar_log() {
+    local lineas
+    [[ -f "${LOG_FILE}" ]] || return 0
+    lineas="$(wc -l <"${LOG_FILE}" 2>/dev/null || printf '0')"
+    (( lineas > LOG_MAX_LINEAS )) || return 0
+    if tail -n "$(( LOG_MAX_LINEAS / 2 ))" "${LOG_FILE}" >"${LOG_FILE}.tmp" 2>/dev/null; then
+        mv -f "${LOG_FILE}.tmp" "${LOG_FILE}" 2>/dev/null || true
+    fi
+    return 0
+}
+
+log() {
+    local nivel="$1"; shift
+    mkdir -p "${STATE_DIR}" 2>/dev/null || true
+    printf '%s [%-5s] %s\n' "$(date '+%F %T')" "${nivel}" "$*" >>"${LOG_FILE}" 2>/dev/null || true
+}
+
+# Registra y, en modo --dry-run, ademas lo imprime por pantalla.
+log_verbose() {
+    log "$@"
+    if (( VERBOSO )); then
+        printf '%s\n' "${*:2}" >&2
+    fi
+    return 0
+}
+
+# Descarga una URL y la imprime por stdout. Si falla, devuelve vacio: quien
+# la llama decide que hacer. Nunca aborta el script.
+descargar() {
+    local url="$1" max="${2:-12}" agente="${3:-}"
+    local args=(-fsS --max-time "${max}")
+    [[ -n "${agente}" ]] && args+=(-H "User-Agent: ${agente}")
+    curl "${args[@]}" "${url}" 2>/dev/null || true
+}
+
+# Numero con coma decimal y los decimales pedidos: decimal 10.25 1 -> 10,2
+# LC_ALL=C para que printf no use la coma del locale es_ES.
+decimal() {
+    local valor="${1:-0}" cifras="${2:-2}"
+    LC_ALL=C printf "%0.${cifras}f" "${valor}" 2>/dev/null | tr '.' ',' || true
+}
+
+# Quita lo que piper leeria mal: &, %, euros, dolares, comillas y saltos.
+limpiar_texto() {
+    printf '%s' "$1" | tr '\n' ' ' | sed \
+        -e 's/&/\& y /g' \
+        -e 's/%/ por ciento/g' \
+        -e 's/€/euros/g' \
+        -e 's/\$/dolares/g' \
+        -e 's/["“”„]/ /g' \
+        -e 's/[[:space:]]\{1,\}/ /g' \
+        -e 's/^ //' \
+        -e 's/ $//'
+}
+
+# Hay curl y jq para consultar la red?
+puede_consultar() {
+    command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1
+}
+
+# ==========================================================================
+# Datos: ubicacion
+# ==========================================================================
+
+# Rellena UBIC_LAT/LON/NOMBRE desde un JSON, con las expresiones jq dadas.
+# Devuelve 1 si el JSON no trae coordenadas.
+ubicacion_desde_json() {
+    local json="$1" expr_lat="$2" expr_lon="$3" expr_nombre="$4"
+    local lat lon nombre
+    lat="$(jq -r "${expr_lat} // empty" <<<"${json}" 2>/dev/null || true)"
+    lon="$(jq -r "${expr_lon} // empty" <<<"${json}" 2>/dev/null || true)"
+    [[ -n "${lat}" && -n "${lon}" ]] || return 1
+    nombre="$(jq -r "${expr_nombre} // empty" <<<"${json}" 2>/dev/null || true)"
+    UBIC_LAT="${lat}"
+    UBIC_LON="${lon}"
+    UBIC_NOMBRE="${nombre:-${CIUDAD:-tu zona}}"
+    log_verbose INFO "ubicacion: ${UBIC_NOMBRE} (${UBIC_LAT}, ${UBIC_LON})"
+    return 0
+}
+
+# Resuelve la ubicacion: coordenadas fijas > geocodificar CIUDAD > IP > Madrid.
+ubicacion() {
+    local json
+
+    if [[ -n "${LAT}" && -n "${LON}" ]]; then
+        UBIC_LAT="${LAT}"
+        UBIC_LON="${LON}"
+        UBIC_NOMBRE="${CIUDAD:-tu zona}"
+        log_verbose INFO "ubicacion: ${UBIC_NOMBRE} (${UBIC_LAT}, ${UBIC_LON})"
+        return 0
+    fi
+
+    if [[ -n "${CIUDAD}" ]]; then
+        json="$(descargar "https://geocoding-api.open-meteo.com/v1/search?name=$(printf '%s' "${CIUDAD}" | sed 's/ /%20/g')&count=1&language=es&format=json")"
+        if [[ -n "${json}" ]] &&
+           ubicacion_desde_json "${json}" '.results[0].latitude' '.results[0].longitude' '.results[0].name'; then
+            return 0
+        fi
+    fi
+
+    json="$(descargar 'https://wttr.in/?format=j1')"
+    if [[ -n "${json}" ]] &&
+       ubicacion_desde_json "${json}" '.nearest_area[0].latitude' '.nearest_area[0].longitude' '.nearest_area[0].areaName[0].value'; then
+        return 0
+    fi
+
+    # Ultima reserva: Madrid.
+    UBIC_LAT="40.4168"
+    UBIC_LON="-3.7038"
+    UBIC_NOMBRE="${CIUDAD:-Madrid}"
+    log WARN "no se pudo localizar la zona; se usa ${UBIC_NOMBRE}"
+    return 0
+}
+
+# Codigo WMO -> texto en castellano.
+texto_wmo() {
+    case "${1:-}" in
+        0)                printf 'cielo despejado' ;;
+        1)                printf 'cielo mayormente despejado' ;;
+        2)                printf 'cielo parcialmente nublado' ;;
+        3)                printf 'cielo nublado' ;;
+        45|48)            printf 'niebla' ;;
+        51|53|55|56|57)   printf 'llovizna' ;;
+        61|63|65|66|67)   printf 'lluvia' ;;
+        71|73|75|77|85|86) printf 'nieve' ;;
+        80|81|82)         printf 'chubascos' ;;
+        95|96|99)         printf 'tormenta' ;;
+        *)                printf '' ;;
+    esac
+}
+
+# ==========================================================================
+# Datos: tiempo (open-meteo y, si falla, wttr.in)
+# ==========================================================================
+
+tiempo_open_meteo() {
+    local url json
+    url="https://api.open-meteo.com/v1/forecast?latitude=${UBIC_LAT}&longitude=${UBIC_LON}"
+    url+="&current=temperature_2m,weather_code"
+    url+="&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+    url+="&timezone=auto&forecast_days=1"
+    json="$(descargar "${url}" 15)"
+    [[ -n "${json}" ]] || return 1
+
+    TIEMPO_TEMP="$(jq -r '.current.temperature_2m // empty' <<<"${json}" 2>/dev/null || true)"
+    [[ -n "${TIEMPO_TEMP}" ]] || return 1
+    TIEMPO_CODIGO="$(jq -r '.current.weather_code // empty' <<<"${json}" 2>/dev/null || true)"
+    TIEMPO_TMAX="$(jq -r '.daily.temperature_2m_max[0] // empty' <<<"${json}" 2>/dev/null || true)"
+    TIEMPO_TMIN="$(jq -r '.daily.temperature_2m_min[0] // empty' <<<"${json}" 2>/dev/null || true)"
+    TIEMPO_PROB="$(jq -r '.daily.precipitation_probability_max[0] // 0' <<<"${json}" 2>/dev/null || true)"
+    return 0
+}
+
+tiempo_wttr() {
+    local json
+    json="$(descargar 'https://wttr.in/?format=j1' 15)"
+    [[ -n "${json}" ]] || return 1
+
+    TIEMPO_TEMP="$(jq -r '.current_condition[0].temp_C // empty' <<<"${json}" 2>/dev/null || true)"
+    [[ -n "${TIEMPO_TEMP}" ]] || return 1
+    TIEMPO_CODIGO="$(jq -r '.current_condition[0].weatherCode // empty' <<<"${json}" 2>/dev/null || true)"
+    TIEMPO_TMAX="$(jq -r '.weather[0].maxtempC // empty' <<<"${json}" 2>/dev/null || true)"
+    TIEMPO_TMIN="$(jq -r '.weather[0].mintempC // empty' <<<"${json}" 2>/dev/null || true)"
+    TIEMPO_PROB="$(jq -r '[.weather[0].hourly[].chanceofrain | select(. != null)] | max // 0' <<<"${json}" 2>/dev/null || true)"
+    return 0
+}
+
+obtener_tiempo() {
+    ubicacion
+    if tiempo_open_meteo; then
+        log_verbose INFO "tiempo (open-meteo): ${TIEMPO_TEMP} grados"
+        return 0
+    fi
+    log WARN "open-meteo no respondio; se intenta wttr.in"
+    if tiempo_wttr; then
+        log_verbose INFO "tiempo (wttr.in): ${TIEMPO_TEMP} grados"
+        return 0
+    fi
+    log WARN "no hay datos del tiempo"
+    return 1
+}
+
+# ==========================================================================
+# Datos: bolsa
+# ==========================================================================
+
+# Ultimo cierre ANTERIOR a la sesion del precio.
+#
+# Yahoo entrega la barra del dia en curso con el cierre a null (pasa con el
+# Ibex), asi que no vale con mirar el ultimo valor de la serie: se busca la
+# ultima barra anterior al precio por su marca de tiempo y se toma el cierre
+# no nulo inmediatamente anterior. Asi la variacion es siempre la de la
+# ultima sesion cerrada.
+cierre_anterior() {
+    local pares="$1" ts_precio="$2"
+    LC_ALL=C awk -F'\t' -v tp="${ts_precio}" '
+        { ts[NR] = $1; cl[NR] = $2; if ($1 + 0 <= tp + 0) ult = NR }
+        END {
+            if (ult == 0) { print ""; exit }
+            for (i = ult - 1; i >= 1; i--) {
+                if (cl[i] != "" && cl[i] != "null") { print cl[i]; exit }
+            }
+        }' <<<"${pares}"
+}
+
+# Cotizacion de un simbolo. Imprime "variacion<TAB>precio" o nada si falla.
+# Escribe por stdout a proposito: asi se puede lanzar en paralelo.
+cotizacion() {
+    local simbolo="$1" url json precio ts_precio pares prev variacion
+    url="https://query1.finance.yahoo.com/v8/finance/chart/${simbolo//^/%5E}?range=5d&interval=1d"
+    json="$(descargar "${url}" 12 'Mozilla/5.0 (X11; Linux x86_64)')"
+    [[ -n "${json}" ]] || return 1
+
+    precio="$(jq -r '.chart.result[0].meta.regularMarketPrice // empty' <<<"${json}" 2>/dev/null || true)"
+    ts_precio="$(jq -r '.chart.result[0].meta.regularMarketTime // 0' <<<"${json}" 2>/dev/null || true)"
+    pares="$(jq -r '.chart.result[0] as $r
+        | [range(0; ($r.timestamp | length))]
+        | map({ ts: $r.timestamp[.], close: ($r.indicators.quote[0].close[.] // null) })
+        | .[] | "\(.ts)\t\(.close)"' <<<"${json}" 2>/dev/null || true)"
+
+    prev="$(cierre_anterior "${pares}" "${ts_precio}")"
+    if [[ -z "${prev}" ]]; then
+        prev="$(jq -r '.chart.result[0].meta.chartPreviousClose // empty' <<<"${json}" 2>/dev/null || true)"
+    fi
+    if [[ -z "${precio}" ]]; then
+        precio="$(LC_ALL=C awk -F'\t' '$2 != "null" && $2 != "" { v = $2 } END { print v }' <<<"${pares}")"
+    fi
+
+    [[ -n "${precio}" && "${precio}" != "null" ]] || return 1
+    [[ -n "${prev}" && "${prev}" != "null" ]] || return 1
+
+    variacion="$(LC_ALL=C awk -v p="${precio}" -v q="${prev}" \
+        'BEGIN { if (q == 0) { print "0.0000" } else { printf "%.4f", (p - q) * 100 / q } }')"
+    printf '%s\t%s\n' "${variacion}" "${precio}"
+}
+
+# Frase de la bolsa. Lanza las consultas en paralelo (son independientes) y
+# las compone en el orden de MERCADOS. Devuelve 1 si no hay ningun dato.
+frase_bolsa() {
+    local item i simbolo nombre f variacion precio direccion frase=""
+    local -a simbolos=() nombres=()
+    local tmp
+
+    for item in ${MERCADOS[@]+"${MERCADOS[@]}"}; do
+        simbolos+=("${item%%|*}")
+        nombres+=("${item##*|}")
+    done
+    (( ${#simbolos[@]} > 0 )) || return 1
+
+    tmp="$(tmpdir)"
+    for i in "${!simbolos[@]}"; do
+        cotizacion "${simbolos[$i]}" >"${tmp}/${i}" 2>/dev/null &
+    done
+    wait || true
+
+    for i in "${!simbolos[@]}"; do
+        f="${tmp}/${i}"
+        if [[ ! -s "${f}" ]]; then
+            log WARN "sin cotizacion para ${simbolos[$i]}"
+            continue
+        fi
+        IFS=$'\t' read -r variacion precio <"${f}"
+        log_verbose INFO "bolsa ${simbolos[$i]}: ${variacion}%"
+
+        direccion="$(LC_ALL=C awk -v v="${variacion}" \
+            'BEGIN { print (v > 0.001) ? "sube" : (v < -0.001 ? "baja" : "plano") }')"
+        if [[ "${direccion}" == "plano" ]]; then
+            frase="${frase}${frase:+, } ${nombres[$i]} queda plano"
+        else
+            # El signo lo lleva la palabra (sube/baja), no el numero.
+            frase="${frase}${frase:+, } ${nombres[$i]} ${direccion} un $(decimal "${variacion#-}" 2) por ciento"
+        fi
+    done
+
+    [[ -n "${frase}" ]] || return 1
+    FRASE_BOLSA="${frase}"
+    return 0
+}
+
+# ==========================================================================
+# Datos: noticias (RSS) y resumen con el LLM local
+# ==========================================================================
+
+# Titulares de las fuentes RSS, en orden y sin repetidos. Las descarga en
+# paralelo con la biblioteca estandar de python3.
+titulares_rss() {
+    python3 - "${MAX_TITULARES}" ${FUENTES[@]+"${FUENTES[@]}"} <<'PY' 2>/dev/null || true
+import sys
+import urllib.request
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+
+limite = int(sys.argv[1])
+fuentes = sys.argv[2:]
+cabeceras = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) morning-briefing/2.0"}
+
+
+def titulos(url):
+    try:
+        peticion = urllib.request.Request(url, headers=cabeceras)
+        crudo = urllib.request.urlopen(peticion, timeout=15).read()
+        raiz = ET.fromstring(crudo)
+        items = raiz.findall(".//item")
+        if not items:
+            items = [e for e in raiz.iter() if e.tag.endswith("}entry")]
+        salida = []
+        for item in items[:5]:
+            for hijo in item:
+                if hijo.tag.endswith("title"):
+                    titulo = (hijo.text or "").strip()
+                    if titulo:
+                        salida.append(titulo)
+                    break
+        return salida
+    except Exception:
+        return []
+
+
+vistos = []
+with ThreadPoolExecutor(max_workers=max(1, len(fuentes))) as pool:
+    for lista in pool.map(titulos, fuentes):
+        for titulo in lista:
+            if titulo not in vistos:
+                vistos.append(titulo)
+
+for titulo in vistos[:limite]:
+    print(titulo)
+PY
+}
+
+# Resumen de las noticias con el LLM local de ollama. Imprime la frase o
+# devuelve 1 si no hay modelo o no responde.
+resumir_noticias() {
+    local titulares="$1" payload respuesta texto
+    [[ -n "${titulares}" ]] || return 1
+
+    payload="$(jq -n \
+        --arg modelo "${LLM_MODEL}" \
+        --arg titulares "${titulares}" \
+        '{
+          model: $modelo,
+          stream: false,
+          think: false,
+          options: { temperature: 0, num_predict: 80 },
+          messages: [
+            { role: "system", content: "Eres un locutor de radio matinal en espanol. Resume las noticias en una sola frase breve y hablable, de 20 palabras como maximo. Prioriza los mercados, la economia y las empresas; si no hay nada de eso, cuenta lo mas importante. Sin listas, sin comillas, sin emojis, sin nombres de medios y sin repetir el titular literal. Empieza directamente con el contenido." },
+            { role: "user", content: ("Titulares:\n" + $titulares) }
+          ]
+        }' 2>/dev/null || true)"
+    [[ -n "${payload}" ]] || return 1
+
+    respuesta="$(curl -fsS --max-time 90 "${LLM_URL}" \
+        -H 'Content-Type: application/json' -d "${payload}" 2>/dev/null || true)"
+    [[ -n "${respuesta}" ]] || return 1
+
+    texto="$(jq -r '.message.content // empty' <<<"${respuesta}" 2>/dev/null || true)"
+    [[ -n "${texto}" && "${texto}" != "null" ]] || return 1
+    printf '%s' "${texto}"
+    return 0
+}
+
+recopilar_noticias() {
+    local titulares resumen
+    titulares="$(titulares_rss)"
+    if [[ -z "${titulares}" ]]; then
+        log WARN "no hay titulares"
+        return 1
+    fi
+    log INFO "titulares: $(grep -c . <<<"${titulares}" || true)"
+
+    if resumen="$(resumir_noticias "${titulares}")" && [[ -n "${resumen}" ]]; then
+        FRASE_NOTICIAS="${resumen}"
+    else
+        log WARN "el LLM no respondio; se leen los titulares tal cual"
+        FRASE_NOTICIAS="$(head -n3 <<<"${titulares}" | tr '\n' ' ')"
+    fi
+    return 0
+}
+
+# Recoge los tres bloques de datos. Cada uno es opcional: si algo falla, el
+# parte sale con lo que haya.
+recopilar_datos() {
+    if ! puede_consultar; then
+        log WARN "faltan curl o jq: el parte sale solo con la fecha y la hora"
+        return 0
+    fi
+    obtener_tiempo || true
+    frase_bolsa || true
+    recopilar_noticias || true
+    return 0
+}
+
+# ==========================================================================
+# Composicion del texto
+# ==========================================================================
+
+# Una sola llamada a date para el saludo, la fecha y la hora.
+leer_reloj() {
+    local h m
+    IFS='|' read -r h m FECHA_LARGA < <(date '+%H|%M|%A %d de %B de %Y')
+
+    case "${h}" in
+        00) HORA_TEXTO="son las 12:${m} de la madrugada" ;;
+        *)  HORA_TEXTO="son las ${h}:${m}" ;;
+    esac
+
+    case "${h}" in
+        0[0-5])        SALUDO="Buenas noches" ;;
+        0[6-9]|1[0-2]) SALUDO="Buenos dias" ;;
+        1[3-9]|20)     SALUDO="Buenas tardes" ;;
+        *)             SALUDO="Buenas noches" ;;   # 21-23
+    esac
+    return 0
+}
+
+construir_texto() {
+    local texto="${SALUDO}. Es ${FECHA_LARGA}, y ${HORA_TEXTO}. "
+    local clima
+
+    if [[ -n "${TIEMPO_TEMP}" ]]; then
+        clima="$(texto_wmo "${TIEMPO_CODIGO}")"
+        texto+="En ${UBIC_NOMBRE} hay $(decimal "${TIEMPO_TEMP}" 1) grados"
+        [[ -n "${clima}" ]] && texto+=" y ${clima}"
+        texto+="."
+        if [[ -n "${TIEMPO_TMAX}" && -n "${TIEMPO_TMIN}" ]]; then
+            texto+=" Con una maxima de $(decimal "${TIEMPO_TMAX}" 0) y una minima de $(decimal "${TIEMPO_TMIN}" 0) grados."
+        fi
+        if [[ -n "${TIEMPO_PROB}" && "${TIEMPO_PROB}" != "0" ]]; then
+            texto+=" Hay un ${TIEMPO_PROB} por ciento de probabilidad de lluvia."
+        fi
+    fi
+
+    [[ -n "${FRASE_BOLSA}" ]] && texto+=" En la bolsa, ${FRASE_BOLSA}."
+    [[ -n "${FRASE_NOTICIAS}" ]] && texto+=" Y en las noticias: ${FRASE_NOTICIAS}"
+
+    printf '%s' "${texto}"
+}
+
+# ==========================================================================
+# Voz
+# ==========================================================================
+
+# Estado del audio: 0 hay salida y no esta silenciada; 2 silenciada; 1 sin
+# reproductor o sin ninguna salida.
+estado_audio() {
+    command -v "${PLAYER}" >/dev/null 2>&1 || return 1
+    command -v pactl >/dev/null 2>&1 || return 1
+    [[ -n "$(pactl list short sinks 2>/dev/null || true)" ]] || return 1
+    if [[ "$(pactl get-sink-mute @DEFAULT_SINK@ 2>/dev/null || true)" == "yes" ]]; then
+        return 2
+    fi
+    return 0
+}
+
+hablar() {
+    local texto="$1" dir raw wav dur
+    local bytes
+
+    [[ -x "${PIPER}" ]] || { log ERROR "no hay piper en ${PIPER}"; return 1; }
+    [[ -s "${MODEL}" ]] || { log ERROR "no hay modelo de voz en ${MODEL}"; return 1; }
+    command -v "${FFMPEG}" >/dev/null 2>&1 || { log ERROR "falta ffmpeg"; return 1; }
+
+    dir="$(tmpdir)"
+    raw="${dir}/voz.raw"
+    wav="${dir}/voz.wav"
+
+    log INFO "sintetizando ${#texto} caracteres"
+    if ! printf '%s\n' "${texto}" | timeout 180 "${PIPER}" -m "${MODEL}" --output_raw >"${raw}" 2>/dev/null; then
+        log ERROR "piper fallo"
+        return 1
+    fi
+    [[ -s "${raw}" ]] || { log ERROR "piper no devolvio audio"; return 1; }
+
+    if ! timeout 60 "${FFMPEG}" -hide_banner -loglevel error -y -f s16le -ar 22050 -ac 1 \
+        -i "${raw}" -af "${CADENA_K2}" -ar 22050 -ac 1 "${wav}" 2>/dev/null; then
+        log ERROR "ffmpeg fallo"
+        return 1
+    fi
+
+    # Duracion del audio (PCM mono de 16 bits a 22050 Hz) para el timeout.
+    bytes="$(stat -c %s "${raw}" 2>/dev/null || printf '0')"
+    dur=$(( bytes / 2 / 22050 ))
+    log INFO "reproduciendo ${dur}s de audio"
+    if ! timeout "$(( dur + 15 ))" "${PLAYER}" "${wav}" >/dev/null 2>&1; then
+        log ERROR "el reproductor fallo"
+        return 1
+    fi
+    log INFO "parte hablado"
+    return 0
+}
+
+# Aviso en pantalla (si hay notify-send).
+avisar() {
+    local texto="$1"
+    command -v notify-send >/dev/null 2>&1 || return 0
+    notify-send --app-name="Parte matinal" --expire-time=25000 \
+        "Parte matinal" "${texto}" >/dev/null 2>&1 || log WARN "no se pudo enviar la notificacion"
+    return 0
+}
+
+# ==========================================================================
+# Sello del dia
+# ==========================================================================
+
+# El sello marca que el saludo automatico de HOY ya se ha dicho. Solo lo
+# escribe el arranque de sesion: una ejecucion manual habla, pero no gasta
+# el saludo del dia (asi probar el script no lo consume).
+ya_hablo_hoy() {
+    local hoy guardado
+    [[ -f "${LAST_RUN}" ]] || return 1
+    hoy="$(date '+%F')"
+    guardado="$(head -n1 "${LAST_RUN}" 2>/dev/null || true)"
+    [[ "${guardado}" == "${hoy}" ]]
+}
+
+poner_sello() {
+    local hoy
+    hoy="$(date '+%F')"
+    printf '%s\n' "${hoy}" >"${LAST_RUN}"
+    log INFO "sello puesto: ${hoy}"
+}
+
+reset_sello() {
+    if [[ -f "${LAST_RUN}" ]]; then
+        rm -f "${LAST_RUN}"
+        log INFO "sello borrado: ${LAST_RUN}"
+    else
+        log INFO "no habia sello que borrar"
+    fi
+    return 0
+}
+
+# ==========================================================================
+# Main
+# ==========================================================================
+
+uso() {
+    cat <<'AYUDA'
+morning-briefing - saludo matinal hablado (fecha, hora, tiempo, bolsa y noticias)
+
+  --autostart  lo usa el arranque de sesion: solo este modo sella el dia
+  --now        habla aunque hoy ya se haya hablado
+  --dry-run    imprime el texto y no suena
+  --reset      borra el sello del dia
+  --ayuda      esta ayuda
+
+Configuracion: ~/.config/morning-briefing/config
+Registro:     ~/.local/state/morning-briefing/briefing.log
+AYUDA
+}
+
+main() {
+    local auto=0 forzar=0 seco=0 audio=0 texto hablado=0
+
+    while (( $# )); do
+        case "$1" in
+            --autostart)       auto=1 ;;
+            --now)             forzar=1 ;;
+            --dry-run)         seco=1 ;;
+            --reset)           reset_sello; exit 0 ;;
+            --ayuda|-h|--help) uso; exit 0 ;;
+            *) printf 'opcion desconocida: %s\n' "$1" >&2; uso >&2; exit 2 ;;
+        esac
+        shift
+    done
+
+    mkdir -p "${STATE_DIR}"
+    rotar_log
+    if (( seco )); then
+        VERBOSO=1
+    fi
+
+    # El sello solo afecta al arranque automatico: una llamada manual habla
+    # siempre (es una peticion explicita) pero sin gastarse el dia. Con
+    # --dry-run no se mira ni se espera: es una revision del texto.
+    if (( auto && ! forzar && ! seco )); then
+        if ya_hablo_hoy; then
+            log INFO "ya se hablo hoy; no se repite"
+            exit 0
+        fi
+        log INFO "esperando ${DELAY}s antes de empezar"
+        sleep "${DELAY}"
+    fi
+
+    if (( ! seco )); then
+        estado_audio || audio=$?
+        case "${audio}" in
+            0) : ;;
+            2) log WARN "el audio esta silenciado; solo queda el aviso en pantalla" ;;
+            *) log WARN "no hay salida de audio; solo queda el aviso en pantalla" ;;
+        esac
+    fi
+
+    recopilar_datos
+
+    # Sin red (todavia no conectada) no hay ni tiempo ni bolsa: se espera y
+    # se reintenta una vez antes de decir un parte a medias.
+    if [[ -z "${TIEMPO_TEMP}" && -z "${FRASE_BOLSA}" ]]; then
+        log WARN "no hay datos; parece que la red no esta lista todavia, se reintenta en 30s"
+        sleep 30
+        recopilar_datos
+    fi
+
+    leer_reloj
+    texto="$(limpiar_texto "$(construir_texto)")"
+    printf '%s\n' "${texto}" >"${LAST_TEXT}" 2>/dev/null || true
+
+    if (( seco )); then
+        printf '%s\n' "${texto}"
+        exit 0
+    fi
+
+    avisar "${texto}"
+
+    if (( audio == 0 )); then
+        if hablar "${texto}"; then
+            hablado=1
+        else
+            log ERROR "no se pudo hablar el parte; se reintentara en el proximo arranque"
+        fi
+    else
+        log WARN "sin audio; solo queda el aviso en pantalla"
+        hablado=1
+    fi
+
+    # Solo el arranque automatico pone el sello: hablar a mano no debe gastar
+    # el saludo de hoy.
+    if (( hablado )); then
+        if (( auto )); then
+            poner_sello
+        else
+            log INFO "parte manual: no se sella el dia"
+        fi
+    fi
+}
+
+main "$@"

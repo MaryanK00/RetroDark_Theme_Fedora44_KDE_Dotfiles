@@ -1,0 +1,975 @@
+/**
+ * Mitad TUI del plugin de voz.
+ *
+ * Se ocupa de los atajos de teclado. El motor de dictado (Whisper + microfono)
+ * es de @juliuskb/opencode-voice, al que aqui se llama por su RPC "voice"
+ * (captura + transcripcion local).
+ *
+ * POR QUE LAS TECLAS NO SE ESCUCHAN POR EL KEYMAP
+ * -----------------------------------------------
+ * La capa del keymap se registra bien (se ve en `keymap.commands()` y
+ * `keymap.shortcuts("voice-tts.dictate")` devuelve el atajo), pero la
+ * pulsacion NUNCA llega a ejecutarla: se comprobo que F9 no hacia nada
+ * mientras que el mismo atajo, capturado de `renderer.keyInput`, funcionaba de
+ * punta a punta. Es un fallo del reparto de teclado de OpenTUI 2.1.1, no del
+ * plugin. Por eso:
+ *
+ *   - Las TECLAS se escuchan de `renderer.keyInput` ("keypress").
+ *   - La capa del keymap se queda SOLO para la paleta de comandos, con
+ *     `bind: false` en todos sus comandos (patron de OpenCode para comandos
+ *     que solo se invocan desde la paleta).
+ *
+ * Ademas, la mitad TUI de @juliuskb esta rota: su `setup()` se queda atascado
+ * en `context.ui.router.register(...)` y nunca llega a `context.keymap.layer(...)`,
+ * asi que su comando `voice.record.toggle` no existe en el keymap.
+ *
+ * Los atajos se leen de `~/.local/share/opencode/voice-tts.json` (se crea solo
+ * con los valores por defecto) y se releen cuando el fichero cambia, para
+ * poder cambiar la tecla sin tocar codigo.
+ *
+ * Nota: `context.storage` NO se puede usar desde la mitad TUI de un plugin
+ * local (el namespace deriva del ID, y el de la mitad TUI es
+ * "<directorio>/tui", con barra -> "Invalid storage segment").
+ */
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
+
+const LOGFILE = join(homedir(), ".local/share/opencode/voice-tui.log")
+
+/** Fichero de atajos, editable por el usuario. */
+const SHORTCUTS_FILE = join(homedir(), ".local/share/opencode/voice-tts.json")
+
+/**
+ * Atajos por defecto.
+ *
+ * `dictate` admite varias teclas: las dos estan activas a la vez porque
+ * `ctrl+space` suele estar asignada en KDE a "cambiar metodo de entrada" y
+ * puede no llegar al terminal.
+ */
+const DEFAULT_SHORTCUTS = {
+  dictate: ["ctrl+space", "alt+d"],
+  mute: ["ctrl+alt+m"],
+  preset: ["ctrl+alt+t"],
+}
+
+/** Cache de atajos: se relee solo cuando cambia el mtime del fichero. */
+let shortcutsCache = null
+let shortcutsMtime = 0
+let shortcutsCheckedAt = 0
+
+/**
+ * ¿Se dibuja el panel lateral?
+ *
+ * El panel necesita el runtime de Solid y, si algo va mal, es mejor quedarse
+ * con los avisos que ver el terminal lleno de errores. Se apaga poniendo
+ * {"panel": false} en el fichero de atajos.
+ */
+/**
+ * Lee los atajos del fichero del usuario.
+ *
+ * Si el fichero no existe lo crea con los valores por defecto. Si el formato
+ * es raro, se ignora lo que haya y se usan los valores por defecto: nunca
+ * debe dejar al plugin sin teclas.
+ */
+function loadShortcuts() {
+  try {
+    if (!existsSync(SHORTCUTS_FILE)) {
+      mkdirSync(join(homedir(), ".local/share/opencode"), { recursive: true })
+      writeFileSync(SHORTCUTS_FILE, JSON.stringify(DEFAULT_SHORTCUTS, null, 2) + "\n")
+      trace("atajos: fichero creado con los valores por defecto")
+      shortcutsCache = DEFAULT_SHORTCUTS
+      shortcutsMtime = 0
+      return shortcutsCache
+    }
+    const mtime = statSync(SHORTCUTS_FILE).mtimeMs
+    // Se comprueba como mucho dos veces por segundo: `loadShortcuts` se llama
+    // en cada pulsacion de tecla y un statSync por tecla es wasteful.
+    const now = Date.now()
+    if (shortcutsCache && now - shortcutsCheckedAt < 500) return shortcutsCache
+    if (shortcutsCache && mtime === shortcutsMtime) return shortcutsCache
+    shortcutsCheckedAt = now
+    const raw = JSON.parse(readFileSync(SHORTCUTS_FILE, "utf8"))
+    const out = {}
+    for (const [action, fallback] of Object.entries(DEFAULT_SHORTCUTS)) {
+      const value = raw?.[action]
+      const list = Array.isArray(value) ? value : typeof value === "string" ? [value] : fallback
+      const clean = list
+        .map((s) => String(s).trim().toLowerCase())
+        .filter((s) => s.length > 0)
+      out[action] = clean.length > 0 ? clean : fallback
+    }
+    shortcutsCache = out
+    shortcutsMtime = mtime
+    trace("atajos cargados:", JSON.stringify(out))
+    return out
+  } catch (err) {
+    trace("no se pudieron leer los atajos, se usan los de por defecto:", errText(err))
+    return shortcutsCache ?? DEFAULT_SHORTCUTS
+  }
+}
+
+function trace(...args) {
+  try {
+    mkdirSync(join(homedir(), ".local/share/opencode"), { recursive: true })
+    appendFileSync(LOGFILE, new Date().toISOString() + " " + args.join(" ") + "\n")
+  } catch {}
+}
+
+/** Identificador de esta instancia de TUI, para recibir solo nuestros eventos. */
+const CLIENT_ID = "voice-tts-tui-" + Math.random().toString(36).slice(2, 10)
+
+/**
+ * Contrato RPC del plugin de dictado (id "voice"). Solo se usa el id y los
+ * nombres de los metodos en tiempo de ejecucion.
+ */
+const VoiceRpc = {
+  id: "voice",
+  methods: {
+    recordStart: { input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, errors: {} },
+    recordStop: { input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, errors: {} },
+    recordCancel: { input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, errors: {} },
+    transcribe: { input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, errors: {} },
+    draftSave: { input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, errors: {} },
+    draftClear: { input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, errors: {} },
+    status: { input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, errors: {} },
+    // Nivel de audio en vivo del microfono: {level: 0..1, recording: bool}.
+    // Lo usa el panel lateral para dibujar el medidor mientras se graba.
+    // OJO: el `output` tiene que declarar sus properties, si no el servidor
+    // responde "Expected never" y la llamada falla.
+    level: {
+      input: { type: "object", additionalProperties: false },
+      output: {
+        type: "object",
+        properties: { level: { type: "number" }, recording: { type: "boolean" } },
+        required: ["level", "recording"],
+        additionalProperties: false,
+      },
+      errors: {},
+    },
+  },
+  events: {
+    result: {
+      schema: {
+        type: "object",
+        properties: {
+          client: { type: "string" },
+          text: { type: "string" },
+          error: { type: "string" },
+          take: { type: "string" },
+        },
+        required: ["client"],
+        additionalProperties: false,
+      },
+    },
+    progress: {
+      schema: {
+        type: "object",
+        properties: { client: { type: "string" }, processedSec: { type: "number" }, totalSec: { type: "number" } },
+        required: ["client", "processedSec", "totalSec"],
+        additionalProperties: false,
+      },
+    },
+  },
+}
+
+/** Contrato RPC de esta misma voz (id "voice-tts"), registrado por index.js. */
+const TtsRpc = {
+  id: "voice-tts",
+  methods: {
+    status: {
+      input: { type: "object", additionalProperties: false },
+      output: {
+        type: "object",
+        properties: {
+          enabled: { type: "boolean" },
+          preset: { type: "string" },
+          presetLabel: { type: "string" },
+          presets: { type: "array", items: { type: "string" } },
+        },
+        additionalProperties: false,
+      },
+      errors: {},
+    },
+    setEnabled: {
+      input: { type: "object", additionalProperties: false },
+      output: {
+        type: "object",
+        properties: { enabled: { type: "boolean" }, preset: { type: "string" } },
+        additionalProperties: false,
+      },
+      errors: {},
+    },
+    setPreset: {
+      input: { type: "object", additionalProperties: false },
+      output: {
+        type: "object",
+        properties: { enabled: { type: "boolean" }, preset: { type: "string" }, error: { type: "string" } },
+        additionalProperties: false,
+      },
+      errors: {},
+    },
+  },
+  events: {},
+}
+
+function errText(err) {
+  if (!err) return "error desconocido"
+  if (typeof err === "string") return err
+  const msg = err?.message ?? err?.data?.message ?? err?.data?.error ?? ""
+  return String(msg || JSON.stringify(err)).slice(0, 300)
+}
+
+/**
+ * Limita la espera de una llamada RPC.
+ *
+ * Sin esto, si el servidor esta caido o reiniciando, la llamada se queda
+ * colgada indefinidamente. En el `setup` eso congela el arranque entero del
+ * TUI (en los logs sale como "plugin operation stalled ... stage=setup
+ * elapsedMs=5000"), y en los atajos deja el TUI sin responder a ninguna tecla.
+ */
+function withTimeout(promise, ms, label) {
+  let timer
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error("timeout esperando a " + label)), ms)
+  })
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer))
+}
+
+async function setupInner(context) {
+  trace("setup: pid", process.pid, "cliente", CLIENT_ID)
+
+  let recording = false
+  // Si esta instancia fue la que empezo a grabar, es responsable de pararla
+  // al descargarse el plugin: si no, el microfono se queda abierto.
+  let startedByUs = false
+  let busy = false
+  // true mientras el borrador esta en el dialogo de revision
+  let draftOpen = false
+
+  // ---- Estado de la voz ---------------------------------------------------
+  // OJO: `context.storage.store` no se puede usar desde la mitad TUI de un
+  // plugin local: el namespace se deriva del ID del plugin y el de la mitad
+  // TUI es "<directorio>/tui", que lleva "/" -> OpenCode lo rechaza con
+  // "Invalid storage segment" y ABORTA el setup (con lo que la capa de
+  // teclado se queda sin registrar). Por eso el estado vive en variables.
+
+  let voiceEnabled = true
+  let presetName = "k2"
+
+  /**
+   * Pinta el panel lateral. Recibe la FASE y compone el texto aqui, para que
+   * el texto exista en un solo sitio y no haya tres ternarios repetidos.
+   *
+   * Un slot NO admite texto plano: OpenTUI exige un elemento de verdad
+   * ("Orphan text error: \"voz: k2\" must have a <text> as a parent"), asi
+   * que hay que crear el <text> con el runtime de Solid. El elemento se crea
+   * dentro de render (que es donde hay contexto de Solid) y se reutiliza.
+   */
+  const toast = (message, variant = "info") => {
+    try {
+      context.ui.toast.show({ title: "Voz", message, variant, duration: 4000 })
+    } catch (err) {
+      trace("toast fallo:", errText(err))
+    }
+  }
+
+  /**
+   * Sesion a la que se envia el dictado.
+   *
+   * La UNICA fuente de verdad es la ruta del TUI, o sea lo que hay en
+   * pantalla. En OpenCode 2.1.1 el comando /new NO crea sesion: navega a la
+   * pantalla de inicio ({type:"home"}) y deja la pestana activa apuntando a
+   * la conversacion ANTERIOR. Por eso aqui no se "adivina" nada: cualquier
+   * fallback (pestana activa, sesion mas reciente, ultima conocida) acaba
+   * mandando el texto a la conversacion anterior, que es justo lo que
+   * fallaba.
+   *
+   * Si no hay ruta de sesion, no hay destino: el envio abre una conversacion
+   * nueva (ver crearSesionDestino).
+   */
+  const sesionDeDestino = () => {
+    try {
+      const route = context.ui.router.current()
+      if (route?.type === "session" && route.sessionID) {
+        trace("sesion de destino: la de la ruta ->", route.sessionID)
+        return route.sessionID
+      }
+      trace("sesion de destino: no hay conversacion abierta (ruta:", route?.type ?? "?", ")")
+      return null
+    } catch (err) {
+      trace("no se pudo leer la ruta:", errText(err))
+      return null
+    }
+  }
+
+  /**
+   * Crea una conversacion nueva y devuelve su id.
+   *
+   * Es lo que hace el TUI cuando escribes un mensaje a mano en la pantalla de
+   * inicio: crea la sesion y luego navega a ella. Aqui se replica, dejando
+   * que el SERVIDOR genere el id ("ses_" + 12 hex). El id NO se inventa ni se
+   * pasa: el schema del cliente es `id?: Session.ID | undefined`, asi que la
+   * clave "id" se omite del todo. Pasarla como null reventaba con
+   *   "Expected Session.ID | null at [\"id\"]"
+   */
+  const crearSesionDestino = async () => {
+    const loc = context.data?.location?.default?.()
+    const location = loc?.directory ? { directory: loc.directory } : undefined
+    const actual = context.ui?.model?.current?.()
+    const model =
+      actual?.providerID && actual?.modelID
+        ? {
+            providerID: actual.providerID,
+            id: actual.modelID,
+            ...(actual.variant ? { variant: actual.variant } : {}),
+          }
+        : undefined
+    let creada = null
+    try {
+      creada = await withTimeout(
+        context.client.session.create({
+          ...(location ? { location } : {}),
+          ...(model ? { model } : {}),
+        }),
+        15000,
+        "session.create",
+      )
+    } catch (err) {
+      // Si el modelo o la location molestan, se reintenta con lo minimo.
+      trace("session.create fallo, se reintenta sin modelo:", errText(err))
+      creada = await withTimeout(
+        context.client.session.create(location ? { location } : {}),
+        15000,
+        "session.create",
+      )
+    }
+    const id = creada?.id
+    if (!id) throw new Error("el servidor no devolvio el id de la sesion")
+    trace("sesion creada ->", id)
+    return id
+  }
+
+  /** Enseña al TUI la sesion nueva y navega hasta ella. */
+  const abrirSesion = async (sessionID) => {
+    try {
+      await context.data?.session?.sync?.(sessionID)
+    } catch (err) {
+      trace("no se pudo sincronizar la sesion nueva:", errText(err))
+    }
+    try {
+      context.ui.router.navigate({ type: "session", sessionID })
+      trace("navegado a la sesion:", sessionID)
+    } catch (err) {
+      trace("no se pudo navegar a la sesion:", errText(err))
+    }
+  }
+
+  /**
+   * Envia el texto a una sesion.
+   *
+   * Si la sesion ya no existe (se borro entre medias, o el TUI se queda con
+   * una ruta vieja) se crea una nueva y se reintenta una vez, para que el
+   * texto no se pierda.
+   */
+  const enviarDictado = async (sessionID, text) => {
+    try {
+      await withTimeout(context.client.session.prompt({ sessionID, text }), 30000, "session.prompt")
+      trace("dictado enviado:", text.length, "caracteres")
+      return true
+    } catch (err) {
+      const msg = errText(err)
+      if (!/not found|404|no existe|does not exist/i.test(msg)) throw err
+      trace("la sesion ya no existe, se abre otra:", sessionID, "|", msg)
+      const nueva = await crearSesionDestino()
+      await abrirSesion(nueva)
+      await withTimeout(context.client.session.prompt({ sessionID: nueva, text }), 30000, "session.prompt")
+      trace("dictado enviado en la sesion nueva:", nueva)
+      return true
+    }
+  }
+
+  // ---- Mandar el dictado a traves del TUI (para respetar el modo) --------
+  //
+  // El modo (plan/build) y el modelo se eligen en el compositor, pero el TUI
+  // solo se los aplica al servidor cuando ENVIA el mensaje: justo antes
+  // llama a session.switchAgent y session.switchModel con lo elegido. Si el
+  // plugin manda el texto con session.prompt, el servidor usa el agente que
+  // tiene guardado en la sesion (el de antes) y el mensaje sale en plan
+  // aunque el usuario ya haya cambiado a build.
+  //
+  // El SDK de plugins no expone el agente que hay elegido, asi que la unica
+  // forma de que el modo se respete es que lo envie el TUI: el texto se pega
+  // en el compositor y se le pide su comando "prompt.submit".
+
+  /** El compositor (el textarea) que tiene el foco, si lo hay. */
+  const compositorConFoco = () => {
+    try {
+      const editor = context.renderer?.currentFocusedEditor
+      if (!editor || editor.isDestroyed) return null
+      return editor
+    } catch (err) {
+      trace("no se pudo leer el compositor:", errText(err))
+      return null
+    }
+  }
+
+  /**
+   * Espera a que el compositor recupere el foco.
+   *
+   * Al cerrarse el dialogo de revision, el TUI devuelve el foco al
+   * compositor (unos milisegundos despues), asi que hay que darle margen.
+   *
+   * Se espera a ESE compositor y no a cualquiera: mientras el dialogo se
+   * cierra, el textarea del propio dialogo tiene el foco y ahi el texto se
+   * perderia (ademas el dialogo ya lleva el texto dentro).
+   */
+  const esperarCompositor = async (editor, ms = 1500) => {
+    const limite = Date.now() + ms
+    while (Date.now() < limite) {
+      if (editor.isDestroyed) return null
+      try {
+        if (context.renderer?.currentFocusedEditor === editor) return editor
+      } catch {}
+      await new Promise((r) => setTimeout(r, 40))
+    }
+    return null
+  }
+
+  /** Espera a que el texto aparezca en el compositor. */
+  const esperarTextoPegado = async (editor, texto, ms = 1000) => {
+    const limite = Date.now() + ms
+    while (Date.now() < limite) {
+      if (String(editor.plainText ?? "").includes(texto)) return true
+      await new Promise((r) => setTimeout(r, 40))
+    }
+    return String(editor.plainText ?? "").includes(texto)
+  }
+
+  /** Espera a que el compositor se vacie: eso significa que el TUI lo mando. */
+  const esperarEnvio = async (editor, texto, ms = 4000) => {
+    const limite = Date.now() + ms
+    while (Date.now() < limite) {
+      if (!String(editor.plainText ?? "").includes(texto)) return true
+      await new Promise((r) => setTimeout(r, 60))
+    }
+    return !String(editor.plainText ?? "").includes(texto)
+  }
+
+  /**
+   * Pega el dictado en el compositor y deja que el TUI lo envie.
+   *
+   * Devuelve:
+   *   - {via:"tui"}     el TUI lo ha enviado (se respeta el modo elegido)
+   *   - {via:"manual"}  el texto esta en el compositor, pero le toca al
+   *                     usuario darle a Enter
+   *   - {via:"directo"} no hay compositor: hay que mandarlo a pelo
+   */
+  const enviarDictadoPorElTUI = async (texto, compositor) => {
+    if (!compositor) {
+      trace("no habia compositor antes del dialogo, se mandaria directo")
+      return { via: "directo", motivo: "no hay compositor con foco" }
+    }
+    const editor = await esperarCompositor(compositor)
+    if (!editor) {
+      trace("el compositor no recupero el foco, se mandaria directo")
+      return { via: "directo", motivo: "el compositor no recupero el foco" }
+    }
+    const previo = String(editor.plainText ?? "")
+    const vacio = previo.trim().length === 0
+    // El pegado va al cursor: se lleva al final para no partir lo que haya.
+    try {
+      editor.gotoBufferEnd?.()
+    } catch {}
+    const contenido = vacio ? texto : previo.endsWith("\n") ? texto : "\n" + texto
+    try {
+      context.renderer.keyInput.processPaste(new TextEncoder().encode(contenido))
+    } catch (err) {
+      trace("no se pudo pegar en el compositor:", errText(err))
+      return { via: "directo", motivo: "no se pudo pegar en el compositor" }
+    }
+    if (!(await esperarTextoPegado(editor, texto))) {
+      trace("el texto no llego al compositor")
+      return { via: "directo", motivo: "el texto no llego al compositor" }
+    }
+    // En modo shell el TUI ejecuta el texto como comando, no lo manda como
+    // mensaje: ahi no se autoenvia, que le de al usuario a Enter.
+    const shell = String(editor.traits?.status ?? "") === "SHELL"
+    trace("compositor:", vacio ? "vacio" : "con texto", "| shell:", shell ? "si" : "no")
+    if (!vacio) return { via: "manual", motivo: "el compositor ya tenia texto" }
+    if (shell) return { via: "manual", motivo: "el compositor esta en modo shell" }
+    // El TUI aplica el modo (plan/build) y el modelo elegidos y manda el
+    // mensaje (creando la conversacion si hace falta).
+    context.keymap.dispatch("prompt.submit")
+    if (await esperarEnvio(editor, texto)) return { via: "tui" }
+    return { via: "manual", motivo: "el texto sigue en el compositor" }
+  }
+
+  const voiceRpc = () => context.client.rpc(VoiceRpc)
+  const ttsRpc = () => context.client.rpc(TtsRpc)
+
+  // ---- Medidor en vivo ----------------------------------------------------
+  // Pregunta al servidor cada 200 ms si el microfono esta grabando y con que
+  // nivel. Asi el panel se enciende tanto si grabamos con nuestro atajo como
+  // si se graba con el atajo del otro plugin (el suyo muestra su propio
+  // panel, este muestra el nuestro).
+
+  /**
+   * Suelta la custodia del audio de una transcripcion.
+   *
+   * El motor de Whisper guarda el audio de la ultima transcripcion y bloquea
+   * el siguiente dictado hasta que el cliente confirme el borrador con
+   * `draftSave({text, take})`. El `take` es el token que llega en el evento
+   * `result`. Sin esta llamada, el segundo dictado falla con:
+   *   "The previous take is not in a draft yet - press the restore key"
+   *
+   * @param {string} take  token de custodia ("" si no lo hay)
+   * @param {string} text  texto final; "" si el usuario lo descarto
+   */
+  const releaseTake = async (take, text) => {
+    if (!take) return
+    try {
+      await withTimeout(voiceRpc().draftSave({ text: text ?? "", take }), 15000, "draftSave")
+      trace("custodia liberada:", take)
+    } catch (err) {
+      trace("NO se pudo liberar la custodia:", errText(err))
+    }
+  }
+
+  // ---- Resultado de la transcripcion -------------------------------------
+  // El servidor devuelve el texto por el evento RPC "result", no por el
+  // valor de retorno de transcribe().
+  try {
+    const off = voiceRpc().events.on("result", async (event) => {
+      const d = event?.data ?? {}
+      if (d.client && d.client !== CLIENT_ID) return
+      const take = typeof d.take === "string" ? d.take : ""
+      trace("evento result:", d.error ? "error=" + d.error : (d.text ?? "").slice(0, 80), "| take:", take || "(ninguno)")
+      if (d.error) {
+        toast("Transcripcion fallida: " + d.error, "error")
+        return
+      }
+      const text = String(d.text ?? "").trim()
+      if (!text) {
+        // Sin texto el servidor no abre custodia, asi que no hay nada que soltar.
+        toast("No se oyo nada", "warning")
+        return
+      }
+      // Borrador editable: se abre un dialogo con el texto ya puesto.
+      let final = text
+      let discarded = false
+      // El compositor que tiene el foco AHORA: al cerrarse el dialogo, el TUI
+      // le devuelve el foco y es ahi donde hay que pegar el texto. Si el
+      // usuario no estaba escribiendo (esta en la lista de conversaciones,
+      // por ejemplo), no hay compositor y el texto se manda a pelo.
+      const compositor = compositorConFoco()
+      draftOpen = true
+      try {
+        const edited = await context.ui.dialog.prompt({
+          title: "Dictado",
+          description: "Revisa el texto. Enter envia, Esc descarta.",
+          value: text,
+        })
+        if (edited === undefined) discarded = true
+        else final = String(edited).trim()
+      } catch (err) {
+        trace("dialogo fallo, se envia el texto tal cual:", errText(err))
+      } finally {
+        draftOpen = false
+      }
+      if (!final) discarded = true
+
+      if (!discarded) {
+        try {
+          // El texto se le pasa al TUI para que lo envie el: asi se aplican el
+          // modo (plan/build) y el modelo que hay elegidos en el compositor.
+          const envio = await enviarDictadoPorElTUI(final, compositor)
+          if (envio.via === "tui") {
+            trace("dictado enviado por el TUI (respeta el modo)")
+          } else if (envio.via === "manual") {
+            toast(
+              "Dictado pegado en el compositor (" + envio.motivo + "). Pulsa Enter para enviarlo.",
+              "info",
+            )
+          } else {
+            // Sin compositor no hay modo que respetar: se manda a la sesion de
+            // la pantalla con el agente que tenga guardado.
+            let sessionID = sesionDeDestino()
+            if (!sessionID) {
+              // No hay ninguna conversacion abierta (pantalla de inicio o /new):
+              // se abre una nueva y se navega a ella, como hace el TUI cuando
+              // escribes un mensaje a mano desde el inicio.
+              sessionID = await crearSesionDestino()
+              await abrirSesion(sessionID)
+            }
+            await enviarDictado(sessionID, final)
+            toast("Enviado con el modo de la conversacion (no habia compositor)", "warning")
+          }
+        } catch (err) {
+          toast("No se pudo enviar: " + errText(err), "error")
+        }
+      } else {
+        toast("Dictado descartado", "info")
+      }
+
+      // ---- Soltar la custodia del audio (OBLIGATORIO) ----------------------
+      // Tras una transcripcion con texto, el servidor guarda el audio y
+      // bloquea el siguiente dictado hasta que el cliente confirme el
+      // borrador con draftSave({text, take}). Si no se hace, el siguiente
+      // intento falla con:
+      //   "The previous take is not in a draft yet - press the restore key"
+      // El texto se guarda como copia de seguridad; al descartarlo se
+      // guarda vacio para que no quede nada pendiente.
+      await releaseTake(take, discarded ? "" : final)
+    })
+    trace("escuchando el evento result")
+    void off
+  } catch (err) {
+    trace("no se pudo suscribir al evento result:", errText(err))
+  }
+
+  // ---- Dictado: grabar / parar ------------------------------------------
+  const toggleDictation = async () => {
+    if (busy) return
+    // Con un borrador a medio revisar, el servidor sigue guardando el audio
+    // de la take anterior y rechazaria una nueva grabacion. Se espera a que
+    // el usuario envie o descarte el borrador.
+    if (draftOpen) {
+      toast("Hay un dictado pendiente de revisar", "info")
+      return
+    }
+    busy = true
+    try {
+      // Se anota el destino solo para la traza: no se cachea, porque al
+      // enviar el usuario puede haber cambiado de conversacion.
+      trace("dictado en la sesion:", sesionDeDestino() ?? "(ninguna)")
+
+      // La verdad la tiene el servidor: si ya hay grabacion (la haya abierto
+      // otra terminal) la paramos; si no, grabamos. Asi dos terminales
+      // abiertas a la vez no se pisan ni desincronizan.
+      const st = await withTimeout(voiceRpc().status({}), 8000, "status")
+      recording = !!st?.recording
+
+      if (!recording) {
+        try {
+          await withTimeout(voiceRpc().recordStart({}), 10000, "recordStart")
+          startedByUs = true
+        } catch (err) {
+          // Puede que otra terminal lo haya empezado entre medias: eso no es
+          // un fallo, es el estado real.
+          if (!/already recording|already running/i.test(errText(err))) throw err
+          startedByUs = false
+          trace("la grabacion ya estaba en marcha")
+        }
+        recording = true
+        trace("grabando")
+        toast("Grabando... vuelve a pulsar para parar", "info")
+        return
+      }
+
+      recording = false
+      startedByUs = false
+      const stopped = await withTimeout(voiceRpc().recordStop({}), 20000, "recordStop")
+      const wav = stopped?.wav
+      const seconds = stopped?.seconds ?? 0
+      trace("grabacion detenida:", seconds, "s ->", wav)
+      if (!wav) {
+        toast("No se grabo nada", "warning")
+        return
+      }
+      toast("Transcribiendo...", "info")
+      await withTimeout(voiceRpc().transcribe({ wav, client: CLIENT_ID }), 20000, "transcribe")
+    } catch (err) {
+      trace("dictado fallo:", errText(err))
+      toast("Dictado: " + errText(err), "error")
+    } finally {
+      busy = false
+    }
+  }
+
+  // ---- Voz de salida: silenciar / cambiar de preset ----------------------
+  const toggleVoice = async () => {
+    try {
+      const st = await withTimeout(ttsRpc().status({}), 8000, "voice-tts.status")
+      const next = !st?.enabled
+      await withTimeout(ttsRpc().setEnabled({ enabled: next }), 8000, "voice-tts.setEnabled")
+      voiceEnabled = next
+      toast(next ? "Voz activada" : "Voz silenciada", next ? "success" : "info")
+    } catch (err) {
+      trace("toggle de voz fallo:", errText(err))
+      toast("Voz: " + errText(err), "error")
+    }
+  }
+
+  const cyclePreset = async () => {
+    try {
+      const st = await withTimeout(ttsRpc().status({}), 8000, "voice-tts.status")
+      const presets = st?.presets ?? []
+      const i = presets.indexOf(st?.preset)
+      const next = presets[(i + 1) % presets.length] ?? st?.preset
+      await withTimeout(ttsRpc().setPreset({ preset: next }), 8000, "voice-tts.setPreset")
+      presetName = next
+      toast("Voz: " + next, "success")
+    } catch (err) {
+      trace("cambio de preset fallo:", errText(err))
+      toast("Voz: " + errText(err), "error")
+    }
+  }
+
+  // ---- Acciones ----------------------------------------------------------
+  // Cada atajo dispara una accion. El antirrebote evita que la misma pulsacion
+  // se cuente dos veces (por ejemplo si la capa del keymap y la captura
+  // directa se activan a la vez).
+  const recent = new Map()
+  const runAction = (action) => {
+    const now = Date.now()
+    if (now - (recent.get(action) ?? 0) < 700) return
+    recent.set(action, now)
+    if (action === "dictate") return toggleDictation()
+    if (action === "mute") return toggleVoice()
+    return cyclePreset()
+  }
+
+  // ---- Comandos para la paleta (SIN teclas) -------------------------------
+  // La capa del keymap se registra bien y sus binds se resuelven, pero la
+  // pulsacion de la tecla nunca llega a ejecutar el comando (fallo del reparto
+  // de teclado de OpenTUI 2.1.1). Por eso aqui NO hay atajos: todos los
+  // comandos llevan `bind: false` y solo se invocan desde la paleta (ctrl+p)
+  // o con su comando slash. Las teclas las lleva la captura directa de mas
+  // abajo.
+  context.keymap.layer(() => ({
+    mode: "global",
+    enabled: true,
+    priority: 100,
+    commands: [
+      {
+        id: "voice-tts.dictate",
+        title: "Voz: dictar (grabar / parar)",
+        group: "Voice",
+        bind: false,
+        palette: true,
+        slash: { name: "dictar" },
+        run: async () => {
+          await runAction("dictate")
+        },
+      },
+      {
+        id: "voice-tts.mute",
+        title: "Voz: silenciar / activar la lectura",
+        group: "Voice",
+        bind: false,
+        palette: true,
+        slash: { name: "silenciar" },
+        run: async () => {
+          await runAction("mute")
+        },
+      },
+      {
+        id: "voice-tts.preset",
+        title: "Voz: cambiar de timbre",
+        group: "Voice",
+        bind: false,
+        palette: true,
+        run: async () => {
+          await runAction("preset")
+        },
+      },
+    ],
+  }))
+  trace("capa de paleta registrada (sin atajos)")
+
+  // ---- Captura directa de teclas (camino principal) ----------------------
+  // La capa del keymap se registra, sus binds se resuelven ("shortcuts" ->
+  // ["f9"]) y el comando se ejecuta con dispatch(), pero la pulsacion de la
+  // tecla NO llega a ejecutar la capa. Por eso aqui escuchamos el evento de
+  // tecla ya parseado que emite el renderizador ("keypress") y decidimos
+  // nosotros. Es el mismo evento que usa el keymap por debajo.
+  //
+  // El evento trae: name, ctrl, meta, option, shift, raw, sequence, source.
+  let offDirect = null
+  try {
+    const keyInput = context.renderer?.keyInput
+    if (!keyInput || typeof keyInput.on !== "function") {
+      throw new Error("el renderizador no expone keyInput")
+    }
+    // Un atajo se escribe como "f9" o "ctrl+alt+d". Se comparan nombre y
+    // modificadores por separado, porque el evento no viene en texto plano.
+    const matches = (ev, spec) => {
+      const parts = String(spec).split("+").map((p) => p.trim().toLowerCase())
+      const key = parts.pop()
+      const wantCtrl = parts.includes("ctrl") || parts.includes("control")
+      const wantMeta = parts.includes("meta") || parts.includes("alt") || parts.includes("option")
+      const wantShift = parts.includes("shift")
+      if (!ev || String(ev.name ?? "").toLowerCase() !== key) return false
+      if (!!ev.ctrl !== wantCtrl) return false
+      if (!!(ev.meta || ev.option) !== wantMeta) return false
+      if (wantShift && !ev.shift) return false
+      return true
+    }
+    // Los atajos vienen del fichero del usuario. Se releen cuando cambia.
+    const DEBUG = process.env.OPENCODE_VOICE_DEBUG === "1"
+    let seen = 0
+    const handler = (ev) => {
+      const shortcuts = loadShortcuts()
+      let hit = null
+      for (const [action, specs] of Object.entries(shortcuts)) {
+        for (const spec of specs) {
+          if (!matches(ev, spec)) continue
+          hit = { action, spec }
+          break
+        }
+        if (hit) break
+      }
+      if (!hit) {
+        // Sin modo debug solo se anotan las teclas que disparan algo.
+        if (DEBUG && seen < 40) {
+          seen++
+          trace(
+            "tecla:",
+            ev?.name,
+            "| ctrl=" + !!ev?.ctrl,
+            "meta=" + !!ev?.meta,
+            "option=" + !!ev?.option,
+            "shift=" + !!ev?.shift,
+            "| raw=" + JSON.stringify(ev?.raw ?? ""),
+            "| seq=" + JSON.stringify(ev?.sequence ?? ""),
+            "| source=" + ev?.source,
+          )
+        }
+        return
+      }
+      trace("ATAJO:", hit.spec, "->", hit.action)
+      void runAction(hit.action)
+    }
+    keyInput.on("keypress", handler)
+
+    // ---- Captura de la secuencia cruda (solo en modo debug) ---------------
+    // El renderizador reparte la entrada entre sus "sequence handlers"; si uno
+    // devuelve algo truthy CONSUME la entrada y los siguientes no la ven.
+    // Este devuelve undefined a proposito: solo mira, no intercepta.
+    //
+    // Se activa con OPENCODE_VOICE_DEBUG=1. Sirve para ver que bytes manda
+    // realmente la terminal (ESC[20~ para F9, ESC[27;9u con el protocolo
+    // kitty, etc.) aunque el evento parseado no llegue a dispararse.
+    let rawHandler = null
+    if (DEBUG) {
+      let rawSeen = 0
+      rawHandler = (seq) => {
+        try {
+          if (rawSeen < 120) {
+            rawSeen++
+            trace("secuencia cruda:", JSON.stringify(String(seq).slice(0, 60)))
+          }
+          const r = context.renderer
+          if (r?._debugInputs?.length) {
+            const last = r._debugInputs[r._debugInputs.length - 1]
+            trace("debug input:", JSON.stringify(last).slice(0, 120))
+            r._debugInputs.length = 0
+          }
+        } catch {}
+        return undefined
+      }
+      try {
+        context.renderer._debugModeEnabled = true
+        context.renderer.prependInputHandler(rawHandler)
+      } catch (err) {
+        trace("no se pudo activar la captura cruda:", errText(err))
+      }
+    }
+
+    offDirect = () => {
+      try {
+        keyInput.off("keypress", handler)
+      } catch {}
+      try {
+        if (rawHandler) context.renderer.removeInputHandler(rawHandler)
+      } catch {}
+    }
+    trace("captura directa ACTIVADA:", JSON.stringify(loadShortcuts()))
+  } catch (err) {
+    trace("captura directa NO disponible:", errText(err))
+  }
+
+  // ---- Autocomprobacion: los dos RPC desde el TUI -----------------------
+  // Comprueba de punta a punta que el TUI puede hablar con el servidor:
+  // el RPC "voice" (motor de dictado) y el "voice-tts" (estado de la voz).
+  //
+  // OJO: esto NO se espera. El `setup` debe terminar SIEMPRE de inmediato:
+  // si espera al servidor y el servidor no responde (esta reiniciando, o
+  // la configuracion se ha movido de sitio), el arranque del TUI se queda
+  // colgado. Va en segundo plano, con limite de tiempo y reintentos: al
+  // arrancar, el servidor puede tardar unos segundos en registrar sus RPC.
+  const selfCheck = async () => {
+    for (let intento = 1; intento <= 4; intento++) {
+      if (intento > 1) await new Promise((r) => setTimeout(r, intento === 2 ? 3000 : 7000))
+      try {
+        const st = await withTimeout(ttsRpc().status({}), 5000, "voice-tts.status")
+        trace("rpc voice-tts status:", JSON.stringify(st))
+        if (st && typeof st.enabled === "boolean") voiceEnabled = st.enabled
+        if (st?.preset) presetName = st.preset
+        try {
+          const vst = await withTimeout(voiceRpc().status({}), 5000, "voice.status")
+          trace("rpc voice status:", JSON.stringify(vst))
+        } catch (err) {
+          trace("rpc voice status fallo:", errText(err))
+        }
+        return
+      } catch (err) {
+        trace(`rpc voice-tts status fallo (intento ${intento}):`, errText(err))
+      }
+    }
+  }
+  void selfCheck()
+
+  return () => {
+    try {
+      offDirect?.()
+    } catch {}
+    // Si grabamos nosotros y nos descargamos, el microfono se queda abierto
+    // para siempre en el servidor: lo paramos aqui.
+    if (startedByUs) {
+      startedByUs = false
+      void (async () => {
+        try {
+          const st = await voiceRpc().status({})
+          if (st?.recording) {
+            await voiceRpc().recordStop({})
+            trace("microfono cerrado al descargar el plugin")
+          }
+        } catch (err) {
+          trace("no se pudo cerrar el microfono:", errText(err))
+        }
+      })()
+    }
+    trace("cleanup")
+  }
+}
+
+trace("MODULO TUI IMPORTADO (nivel de modulo)")
+export default {
+  id: "opencode-voice-tts/tui",
+
+  /**
+   * El setup NUNCA debe lanzar.
+   *
+   * Si lanza, el plugin no carga y el TUI se queda sin sus atajos; ademas el
+   * arranque se ralentiza ("plugin operation stalled"). Todo lo opcional va
+   * con su propio try/catch, y esto es la ultima red de seguridad.
+   */
+  async setup(context) {
+    try {
+      return await setupInner(context)
+    } catch (err) {
+      trace("setup fallo:", errText(err))
+      try {
+        context.ui.toast.show({
+          title: "Voz",
+          message: "El plugin de voz no ha podido arrancar: " + errText(err),
+          variant: "error",
+          duration: 15000,
+        })
+      } catch {}
+      return () => trace("cleanup")
+    }
+  },
+}

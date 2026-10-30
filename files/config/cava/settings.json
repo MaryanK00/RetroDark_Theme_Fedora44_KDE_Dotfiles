@@ -1,0 +1,13 @@
+
+```json
+{
+  "background": "#0a0a0a",
+  "foreground": "#FF0000",
+  "cursorColor": "#FFFF00",
+  "paletteColors": [
+    "#000000", "#FF0000", "#00FF00", "#0000FF",
+    "#FF00FF", "#00FFFF", "#FFFFFF", "#808080",
+    "#A52A2A", "#008B00", "#00008B", "#EE82EE",
+    "#AFEEEE", "#ADD8E6", "#90EE90"  // Últimos dos colores de la paleta
+   ]
+}
